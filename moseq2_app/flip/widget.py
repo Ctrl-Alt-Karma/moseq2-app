@@ -245,24 +245,58 @@ class FlipClassifierWidget:
                 path = str(path)
                 with h5py.File(path, mode='a') as f:
                     output_movie = path.replace('.h5', '_flipped.mp4')
-    
+
+                    # Rotating frames and adding pi to the angle are their own
+                    # inverses, so re-running this would silently undo a previous
+                    # correction. Refuse to apply twice.
+                    if f.attrs.get('flip_classifier_applied', False):
+                        warnings.warn(
+                            f'Flip classifier already applied to {key}; skipping '
+                            'to avoid reverting the existing correction.')
+                        continue
+
                     frames = f[frame_path]
-                    frame_batches = gen_batch_sequence(len(frames)-1, chunk_size, chunk_overlap)
-    
+                    # process every frame; this previously passed len(frames)-1
+                    # and so never classified the final frame
+                    frame_batches = gen_batch_sequence(len(frames), chunk_size, chunk_overlap)
+
+                    # frames already corrected in this run. Overlapping batches
+                    # share frames, and re-rotating one would undo its correction.
+                    committed = np.zeros(len(frames), dtype=bool)
+
                     for batch in tqdm(frame_batches, desc=f'Adjusting flips: {key}', disable=not verbose):
-                        frame_batch = frames[batch]
-    
-                        # apply flip classifier on each batch to find which frames to flip
+                        batch_idx = np.asarray(list(batch))
+                        frame_batch = frames[batch_idx]
+
+                        # apply flip classifier on each batch to find which frames to flip.
+                        # the whole batch (including any overlap) is classified so the
+                        # median smoothing has full context at the chunk boundaries
                         flips = get_flips(frame_batch.copy(), flip_file=clf_path, smoothing=smoothing)
-                        flip_indices = np.where(flips)
-    
-                        # rewrite the frames with the newly classified orientation
-                        frame_batch[flip_indices] = np.rot90(f[frame_path][batch][flip_indices], k=2, axes=(1, 2))
-                        f[frame_path][batch] = frame_batch
-    
-                        # augment recorded scalar value to reflect orientation switches
-                        f['scalars/angle'][flip_indices] += np.pi
-    
+
+                        # only commit frames not already handled by an earlier batch
+                        new_local = np.flatnonzero(~committed[batch_idx])
+                        if len(new_local) == 0:
+                            continue
+
+                        flip_local = new_local[flips[new_local]]
+                        if len(flip_local) > 0:
+                            # map batch-relative positions to absolute frame indices.
+                            # the angle update previously used the batch-relative
+                            # indices directly against the whole-session angle array,
+                            # so every batch after the first rotated the angle of the
+                            # wrong frames.
+                            flip_abs = batch_idx[flip_local]
+
+                            rotated = np.rot90(frames[flip_abs], k=2, axes=(1, 2))
+                            frames[flip_abs] = rotated
+                            frame_batch[flip_local] = rotated
+
+                            angles = f['scalars/angle'][flip_abs]
+                            f['scalars/angle'][flip_abs] = angles + np.pi
+
+                        committed[batch_idx[new_local]] = True
+
+
                         if write_movie:
                             try:
                                 # Writing frame batch to mp4 file
@@ -279,6 +313,9 @@ class FlipClassifierWidget:
                                 print(e)
                                 print(e.__traceback__)
                                 break
+                    # mark the session so a re-run does not revert the correction
+                    f.attrs['flip_classifier_applied'] = True
+
                     # Check if video is done writing. If not, wait.
                     if video_pipe is not None:
                         video_pipe.communicate()

@@ -23,6 +23,34 @@ from moseq2_viz.model.trans_graph import (get_trans_graph_groups, get_group_tran
                                          convert_transition_matrix_to_ebunch,
                                          convert_ebunch_to_graph, make_transition_graphs, get_pos)
 
+# Columns where a missing value genuinely means zero: the session simply never
+# performed that syllable, so a count/frequency of 0 is the correct observation.
+# Every other numeric column is a physical measurement (duration, velocity,
+# height, distance) that is undefined when the syllable was never performed --
+# filling those with 0 invents impossible data points (0 mm tall, 0 mm/frame)
+# that drag group means down and inflate within-group variance.
+COUNT_COLUMNS = ('usage',)
+
+
+def fill_missing_syllable_stats(df):
+    """
+    Fill missing syllable statistics, distinguishing counts from measurements.
+
+    Args:
+    df (pd.DataFrame): syllable statistics dataframe.
+
+    Returns:
+    df (pd.DataFrame): copy with count columns zero-filled and physical scalars
+        left as NaN so downstream means and hypothesis tests skip them.
+    """
+
+    df = df.copy()
+    for column in COUNT_COLUMNS:
+        if column in df.columns:
+            df[column] = df[column].fillna(0)
+    return df
+
+
 class InteractiveSyllableStats(SyllableStatWidgets):
 
     def __init__(self, index_path, model_path, df_path, info_path, max_sylls, load_parquet):
@@ -160,9 +188,7 @@ class InteractiveSyllableStats(SyllableStatWidgets):
         self.df = df.merge(info_df, on='syllable')
         self.df['SubjectName'] = self.df['SubjectName'].astype(str)
         self.df['SessionName'] = self.df['SessionName'].astype(str)
-        # When syllable usage is 0, the scalars will have nan affecting the interactive stat plot
-        # Since syllable usage is 0, the nan in scalars will be filled with 0
-        self.df.fillna(0, inplace=True)
+        self.df = fill_missing_syllable_stats(self.df)
 
     def run_selected_hypothesis_test(self, hyp_test_name, stat, ctrl_group, exp_group):
         """
@@ -229,7 +255,7 @@ class InteractiveSyllableStats(SyllableStatWidgets):
         sig_sylls = []
 
         # Get current dataFrame to plot
-        df = self.df.fillna(0)
+        df = fill_missing_syllable_stats(self.df)
 
         # Handle names to query DataFrame with
         stat = self.dropdown_mapping[stat.lower()]

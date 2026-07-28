@@ -359,10 +359,17 @@ class SyllableLabeler(SyllableLabelerWidgets):
         info_cm_paths = [s['crowd_movie_path'] for s in self.syll_info.values()]
 
         if set(crowd_movie_paths) != set(info_cm_paths):
-            exp = re.compile(r'.*sorted-id-(?P<sorted_id>\d{1,3}).\((?P<sort_type>\w+)\)_original-id-(?P<original_id>\d{1,3})')
+            # \d+ rather than \d{1,3} so models with >= 1000 syllables parse, and
+            # the '.' before the sort type is escaped so it matches a literal dot
+            exp = re.compile(r'.*sorted-id-(?P<sorted_id>\d+)\.\((?P<sort_type>\w+)\)_original-id-(?P<original_id>\d+)')
             for cm in crowd_movie_paths:
                 # Parse paths to get corresponding syllable number
-                match_groups = exp.search(cm).groupdict()
+                match = exp.search(cm)
+                if match is None:
+                    # any other .mp4 sitting in the crowd movie directory; skip it
+                    # rather than raising AttributeError on None.groupdict()
+                    continue
+                match_groups = match.groupdict()
                 match_groups = {k: int(v) if v.isdigit() else v for k, v in match_groups.items()}
                 sorted_num = match_groups['sorted_id']
                 if sorted_num in self.syll_info:
@@ -675,11 +682,14 @@ class CrowdMovieComparison(CrowdMovieCompareWidgets):
                 try:
                     # The 'pdf' key is pointing to the outputted syllable-position heatmap for each grouping.
                     group_syllable_pdf = syll_info_df[group_name]['pdf'].iloc[self.cm_syll_select.index]
-                except Exception as e:
-                    # If a group does not express this syllable, then a empty heatmap will be generated in it's place.
-                    group_syllable_pdf = np.zeros((50, 50))
-                    if len(cm_path) == 0:
-                        continue
+                except (KeyError, IndexError):
+                    # This group never expressed this syllable, so there is no
+                    # position distribution to show. Skip it rather than rendering
+                    # a zeros array, which draws as a plausible-looking uniform
+                    # heatmap and is indistinguishable from real data. Narrow
+                    # exceptions so genuine errors surface instead of being
+                    # silently replaced with fabricated values.
+                    continue
 
                 pdf_fig = self.get_pdf_plot(group_syllable_pdf, group_name)
 
