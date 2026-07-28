@@ -30,8 +30,9 @@ def check_timestamp_error_percentage(timestamps, fps=30, scaling_factor=1000):
 
     # Check if the timestamps are in milliseconds based on the mean difference amount
     if np.mean(diff) > 10:
-        # rescale the timestamps to seconds
-        diff /= scaling_factor
+        # rescale the timestamps to seconds (out-of-place so integer timestamp
+        # arrays are promoted to float instead of raising a dtype casting error)
+        diff = diff / scaling_factor
 
     # Find the average time difference between frames.
     avgTime = np.mean(diff)
@@ -56,7 +57,7 @@ def count_nan_rows(scalar_df):
     n_missing_frames (int): Number of frames with NaN computed scalar values.
     """
 
-    return scalar_df.isnull().any(1).sum()
+    return scalar_df.isnull().any(axis=1).sum()
 
 
 def count_missing_mouse_frames(scalar_df):
@@ -84,7 +85,10 @@ def count_frames_with_small_areas(scalar_df):
     corrupt_frames (int): Number of frames where the recorded mouse area is too small
     """
 
-    return (scalar_df["area_px"] < 2 * scalar_df["area_px"].std()).sum()
+    areas = scalar_df["area_px"]
+    # frames more than 2 standard deviations below the mean area
+    threshold = areas.mean() - 2 * areas.std()
+    return (areas < threshold).sum()
 
 
 def count_stationary_frames(scalar_df):
@@ -99,7 +103,7 @@ def count_stationary_frames(scalar_df):
     """
     
     # subtract 1 because first frame is always 0mm/s
-    return (scalar_df["velocity_2d_mm"] < 0.1).sum() - 1
+    return max(0, (scalar_df["velocity_2d_mm"] < 0.1).sum() - 1)
 
 
 def get_scalar_df(path_dict):
@@ -120,8 +124,8 @@ def get_scalar_df(path_dict):
         if not v.endswith('.mp4'):
             continue
         # Get relevant extraction paths
-        h5path = v.replace('mp4', 'h5')
-        yamlpath = v.replace('mp4', 'yaml')
+        h5path = v.replace('.mp4', '.h5')
+        yamlpath = v.replace('.mp4', '.yaml')
 
         if not exists(yamlpath):
             print(f'No valid yaml path for session: {k}')
@@ -315,13 +319,14 @@ def print_validation_results(scalar_df, status_dicts):
         print(f'{bcolors.BOLD}{bcolors.UNDERLINE}Session: {session_name}; Subject: {subject_name} flags:{bcolors.ENDC}')
         for k1, v1 in print_dict[k].items():
             if k1 != 'metadata':
-                # scalar anomaly flag
-                if v1:
+                # percentage-based flags (dropped_frames, stationary, missing,
+                # size_anomaly, corrupted) are stored as floats; show the value
+                if isinstance(v1, float):
+                    x = f'{k1} flag raised: {v1*100:.2f}%'
+                    print(f'\t{bcolors.WARNING}Warning: {x}{bcolors.ENDC}')
+                # boolean flags (e.g. scalar_anomaly)
+                elif v1:
                     x = f'{k1} flag raised'
                     print(f'\t{bcolors.WARNING}Warning: {x}{bcolors.ENDC}')
-                # all the other flags
-                elif isinstance(v1, float):
-                    x = f'{k1} flag raised: {v1*100:.2f}%'
-                    print(f'\t{bcolors.WARNING}Warning: {x}{bcolors.ENDC}') 
         # I assume this is printing a new line
         print()

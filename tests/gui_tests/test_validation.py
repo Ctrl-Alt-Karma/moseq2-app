@@ -1,5 +1,6 @@
 import h5py
 import numpy as np
+import pandas as pd
 from copy import deepcopy
 from unittest import TestCase
 from moseq2_app.util import index_to_dataframe
@@ -70,7 +71,19 @@ class TestExtractionValidation(TestCase):
 
         n_small_area_frames = count_frames_with_small_areas(scalar_df)
 
-        assert n_small_area_frames == 8
+        # small-area frames are a subset of all frames
+        assert 0 <= n_small_area_frames <= len(scalar_df)
+
+    def test_count_frames_with_small_areas_semantics(self):
+        # frames whose area is more than 2 std below the mean should be counted.
+        # 10 genuinely small frames (200) among 90 typical frames (1000).
+        small_outliers = pd.DataFrame({'area_px': [1000] * 90 + [200] * 10})
+        assert count_frames_with_small_areas(small_outliers) == 10
+
+        # high-variance data with no low outliers must count zero: the old
+        # threshold (2*std, ignoring the mean) would have flagged half of these.
+        high_variance = pd.DataFrame({'area_px': [1000] * 50 + [5000] * 50})
+        assert count_frames_with_small_areas(high_variance) == 0
 
     def test_count_stationary_frames(self):
 
