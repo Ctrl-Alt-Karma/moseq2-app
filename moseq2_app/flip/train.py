@@ -73,7 +73,7 @@ def create_training_dataset(
     )
     frames = np.concatenate((frames, shifted_frames, cleaned_frames), axis=0)
     print(
-        f"Training data shape: {frames.shape}; memory usage: {frames.nbytes / 1e9 * 4:0.2f} GB"
+        f"Training data shape: {frames.shape}; memory usage: {frames.nbytes / 1e9:0.2f} GB"
     )
 
     flipped = np.concatenate((flipped, flipped, flipped), axis=0)
@@ -84,16 +84,6 @@ def create_training_dataset(
 
 def flatten(array: np.ndarray) -> np.ndarray:
     return array.reshape(len(array), -1)
-
-
-def batch_apply_pca(frames: np.ndarray, pca: PCA, batch_size: int = 1000) -> np.ndarray:
-    output = []
-    if len(frames) < batch_size:
-        return pca.transform(flatten(frames)).astype(np.float32)
-
-    for arr in np.array_split(frames, len(frames) // batch_size):
-        output.append(pca.transform(flatten(arr)).astype(np.float32))
-    return np.concatenate(output, axis=0).astype(np.float32)
 
 
 def train_classifier(
@@ -110,12 +100,13 @@ def train_classifier(
     frames = data["frames"]
     flipped = data["flipped"]
 
-    print("Fitting PCA")
-    pca = PCA(n_components=n_components)
-    pca.fit(flatten(frames[-len(frames) // 3:]))
-
+    # PCA is a stage of the pipeline rather than pre-fit on the whole dataset,
+    # so cross_val_score refits it on each training fold only. Pre-fitting PCA
+    # on all frames let information from the held-out folds leak in and
+    # optimistically inflated the reported held-out accuracy.
     pipeline = make_pipeline(
-        FunctionTransformer(batch_apply_pca, kw_args={"pca": pca}, validate=False),
+        FunctionTransformer(flatten, validate=False),
+        PCA(n_components=n_components),
         StandardScaler(),
         (
             RandomForestClassifier(n_estimators=150)
