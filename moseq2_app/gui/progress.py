@@ -286,7 +286,8 @@ def find_progress(base_progress):
     models = glob(join(base_dir, '**/*.p'), recursive=True)
 
     if len(models) > 1:
-        models = sorted(models, key=os.path.getmtime)
+        # sort newest-first so models[0] is the most recently generated model
+        models = sorted(models, key=os.path.getmtime, reverse=True)
         print(f'More than 1 model found. Setting model path to latest generated model: {models[0]}')
     # avoid models not found
     if len(models) > 0:
@@ -438,7 +439,7 @@ def get_extraction_progress(base_dir, exts=['dat', 'mkv', 'avi']):
         extracted_path = e_path_dict.get(k, v)
         extracted = False
         if '.mp4' in extracted_path:
-            yaml_path = extracted_path.replace('mp4', 'yaml')
+            yaml_path = extracted_path.replace('.mp4', '.yaml')
             if check_completion_status(yaml_path):
                 extracted = True
                 num_extracted += 1
