@@ -19,9 +19,18 @@ from moseq2_extract.io.video import write_frames_preview
 #: h5 dataset holding the flip-classifier processing record.
 FLIP_RECORD_PATH = 'metadata/processing/flip_classifier'
 
+#: Second slot for crash-safe record replacement. Readers select the valid
+#: record with the highest journal sequence, so one durable slot always remains
+#: while the other is replaced.
+FLIP_RECORD_JOURNAL_PATH = FLIP_RECORD_PATH + '_journal'
+
 #: h5 attribute used before the structured record existed. Still honoured when
 #: reading so files processed by the older code are not reprocessed.
 LEGACY_FLIP_ATTR = 'flip_classifier_applied'
+
+#: Durable fail-closed sentinel set before a record update begins and cleared
+#: only after the new slot has been flushed.
+FLIP_RECORD_UPDATE_ATTR = 'flip_classifier_record_update_in_progress'
 
 
 # Workaround for HoloViews/Bokeh _buffers parameter issue
@@ -144,18 +153,39 @@ def read_flip_record(f):
         if they carry the old boolean attribute, and ``{'state': 'not_started'}``
         otherwise, so callers never have to special-case the old format.
     """
-    if FLIP_RECORD_PATH in f:
-        raw = f[FLIP_RECORD_PATH][()]
+    if f.attrs.get(FLIP_RECORD_UPDATE_ATTR, False):
+        return {
+            'state': 'failed',
+            'error': 'flip processing record update was interrupted',
+        }
+
+    valid = []
+    corrupt = []
+    for path in (FLIP_RECORD_PATH, FLIP_RECORD_JOURNAL_PATH):
+        if path not in f:
+            continue
+        raw = f[path][()]
         if isinstance(raw, bytes):
             raw = raw.decode()
         try:
             record = json.loads(raw)
-        except ValueError:
-            # a truncated record means the process died mid-write; treat the
-            # file as being in an unknown state rather than as untouched
-            return {'state': 'failed', 'error': 'processing record is corrupt'}
+            sequence = int(record.pop('_journal_sequence', 0))
+            valid.append((sequence, record))
+        except (TypeError, ValueError):
+            corrupt.append(path)
+
+    if valid:
+        _, record = max(valid, key=lambda item: item[0])
         record.setdefault('state', 'failed')
         return record
+
+    if corrupt:
+        # A truncated record means the process died mid-write; treat the file as
+        # being in an unknown state rather than as untouched.
+        return {
+            'state': 'failed',
+            'error': 'processing record is corrupt: {}'.format(', '.join(corrupt)),
+        }
 
     if f.attrs.get(LEGACY_FLIP_ATTR, False):
         return {'state': 'complete', 'legacy': True,
@@ -165,25 +195,73 @@ def read_flip_record(f):
     return {'state': 'not_started'}
 
 
-def write_flip_record(f, record):
+def write_flip_record(f, record, fault_inject=None):
     """
     Write (or replace) the flip-classifier processing record in an open h5 file.
 
-    The record is flushed immediately. This matters: the whole point of the
-    ``in_progress`` state is that it survives the process being killed halfway
-    through rewriting the frames.
+    Updates use a two-slot journal. The legacy Boolean safety latch and an
+    update sentinel are flushed first; then only the inactive record slot is
+    replaced. The sentinel is cleared only after the new slot is durable. At
+    every interruption point, an older app sees the Boolean as true and this
+    reader sees either the prior valid slot or a fail-closed interrupted update.
 
     Args:
     f (h5py.File): open extraction h5, opened for writing.
     record (dict): JSON-serialisable processing record.
+    fault_inject (callable): test-only hook called after each durable update
+        stage with its stage name.
     """
-    if FLIP_RECORD_PATH in f:
-        del f[FLIP_RECORD_PATH]
-    f.create_dataset(FLIP_RECORD_PATH, data=json.dumps(record))
-    # keep the legacy attribute in sync so older moseq2-app installs still see
-    # a completed file as completed
-    f.attrs[LEGACY_FLIP_ATTR] = record.get('state') == 'complete'
+
+    def checkpoint(stage):
+        if fault_inject is not None:
+            fault_inject(stage)
+
+    # Older app versions understand only this Boolean. It must be true for
+    # in_progress, failed, and complete because frames may have been touched in
+    # every one of those states.
+    f.attrs[LEGACY_FLIP_ATTR] = True
+    f.attrs[FLIP_RECORD_UPDATE_ATTR] = True
     f.flush()
+    checkpoint('after_sentinel_flush')
+
+    slots = (FLIP_RECORD_PATH, FLIP_RECORD_JOURNAL_PATH)
+    latest_path = None
+    latest_sequence = -1
+    for path in slots:
+        if path not in f:
+            continue
+        try:
+            raw = f[path][()]
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            existing = json.loads(raw)
+            sequence = int(existing.get('_journal_sequence', 0))
+        except (TypeError, ValueError):
+            continue
+        if sequence > latest_sequence:
+            latest_path = path
+            latest_sequence = sequence
+
+    target_path = (
+        FLIP_RECORD_JOURNAL_PATH
+        if latest_path == FLIP_RECORD_PATH
+        else FLIP_RECORD_PATH
+    )
+    if target_path in f:
+        del f[target_path]
+        f.flush()
+    checkpoint('after_inactive_slot_clear')
+
+    stored = dict(record)
+    stored['_journal_sequence'] = latest_sequence + 1
+    f.create_dataset(target_path, data=json.dumps(stored))
+    checkpoint('after_new_slot_create')
+    f.flush()
+    checkpoint('after_new_slot_flush')
+
+    del f.attrs[FLIP_RECORD_UPDATE_ATTR]
+    f.flush()
+    checkpoint('after_sentinel_clear')
 
 
 def check_flip_state(key, path, record):
@@ -553,12 +631,10 @@ class FlipClassifierWidget:
                     committed = np.zeros(len(frames), dtype=bool)
                     make_movie = write_movie
                     n_flipped = 0
-                    # preview state: None when no movie was asked for, True while
-                    # it is still being written successfully, False once a write
-                    # has failed. Recorded either way -- a session whose frames
-                    # are correct but whose preview is missing is a different
-                    # thing from one where both succeeded.
-                    preview_ok = True if write_movie else None
+                    # Preview success is UNKNOWN until the subprocess has been
+                    # finalized and its exit status inspected. No terminal
+                    # processing record is written before that happens.
+                    preview_ok = False if write_movie else None
                     preview_error = None
 
                     try:
@@ -627,6 +703,44 @@ class FlipClassifierWidget:
                                     make_movie = False
                                     preview_ok = False
                                     preview_error = '{}: {}'.format(type(e).__name__, e)
+
+                        if video_pipe is not None:
+                            try:
+                                _, stderr = video_pipe.communicate()
+                                returncode = video_pipe.returncode
+                                if returncode == 0 and preview_error is None:
+                                    preview_ok = True
+                                elif returncode != 0:
+                                    if isinstance(stderr, bytes):
+                                        stderr = stderr.decode(errors='replace')
+                                    detail = str(stderr).strip() if stderr else ''
+                                    preview_error = (
+                                        'preview subprocess exited with status {}{}'
+                                        .format(
+                                            returncode,
+                                            ': ' + detail if detail else '',
+                                        )
+                                    )
+                                    warnings.warn(
+                                        'Could not finalize flipped movie for '
+                                        '{}:{}. Continuing with corrected '
+                                        'frames; the preview failure is '
+                                        'recorded.'.format(key, path)
+                                    )
+                            except Exception as e:
+                                preview_ok = False
+                                preview_error = '{}: {}'.format(
+                                    type(e).__name__, e
+                                )
+                                warnings.warn(
+                                    'Could not finalize flipped movie for '
+                                    '{}:{}. Continuing with corrected frames; '
+                                    'the preview failure is recorded.'.format(
+                                        key, path
+                                    )
+                                )
+                            finally:
+                                video_pipe = None
                     except BaseException as e:
                         # Record the failure in the file itself before it propagates.
                         # The frames written so far are already corrected and the rest
@@ -674,11 +788,6 @@ class FlipClassifierWidget:
                             'were never classified, so the session is only partially '
                             'corrected. It has been marked failed and will not be '
                             'reprocessed; re-extract it before retrying.')
-
-                    # Check if video is done writing. If not, wait.
-                    if video_pipe is not None:
-                        video_pipe.communicate()
-                        video_pipe = None
 
     @property
     def training_data_path(self):

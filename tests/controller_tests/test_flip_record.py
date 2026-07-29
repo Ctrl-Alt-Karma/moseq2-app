@@ -19,7 +19,8 @@ from unittest import TestCase
 import h5py
 import numpy as np
 
-from moseq2_app.flip.widget import (FLIP_RECORD_PATH, LEGACY_FLIP_ATTR,
+from moseq2_app.flip.widget import (FLIP_RECORD_PATH, FLIP_RECORD_JOURNAL_PATH,
+                                    FLIP_RECORD_UPDATE_ATTR, LEGACY_FLIP_ATTR,
                                     FlipProcessingError, _sha256,
                                     read_flip_record, write_flip_record)
 
@@ -81,14 +82,93 @@ class TestFlipRecord(TestCase):
             self.assertEqual(read_flip_record(f)['state'], 'complete')
 
     def test_legacy_attribute_tracks_completion(self):
-        """Older moseq2-app installs read the attribute, so keep it truthful."""
+        """Older apps must refuse every state where frames may be touched."""
         with self._h5() as f:
             write_flip_record(f, {'state': 'in_progress'})
-            self.assertFalse(f.attrs[LEGACY_FLIP_ATTR])
+            self.assertTrue(f.attrs[LEGACY_FLIP_ATTR])
             write_flip_record(f, {'state': 'failed'})
-            self.assertFalse(f.attrs[LEGACY_FLIP_ATTR])
+            self.assertTrue(f.attrs[LEGACY_FLIP_ATTR])
             write_flip_record(f, {'state': 'complete'})
             self.assertTrue(f.attrs[LEGACY_FLIP_ATTR])
+
+    def test_fault_injection_never_fails_open(self):
+        stages = (
+            'after_sentinel_flush',
+            'after_inactive_slot_clear',
+            'after_new_slot_create',
+            'after_new_slot_flush',
+        )
+        for stage in stages:
+            path = join(self.tmp, stage + '.h5')
+            with h5py.File(path, 'w') as f:
+                write_flip_record(f, {'state': 'in_progress', 'version': 1})
+
+            def inject(current, fail_at=stage):
+                if current == fail_at:
+                    raise RuntimeError('fault at ' + current)
+
+            with self.assertRaisesRegex(RuntimeError, stage):
+                with h5py.File(path, 'a') as f:
+                    write_flip_record(
+                        f,
+                        {'state': 'failed', 'version': 2},
+                        fault_inject=inject,
+                    )
+
+            with h5py.File(path, 'r') as f:
+                # The legacy reader's only signal must stay latched, and the new
+                # reader must never interpret an interrupted update as pristine.
+                self.assertTrue(f.attrs[LEGACY_FLIP_ATTR], stage)
+                self.assertNotEqual(read_flip_record(f)['state'], 'not_started')
+                self.assertTrue(
+                    f.attrs.get(FLIP_RECORD_UPDATE_ATTR, False),
+                    stage,
+                )
+                self.assertTrue(
+                    FLIP_RECORD_PATH in f or FLIP_RECORD_JOURNAL_PATH in f,
+                    stage,
+                )
+
+    def test_initial_record_fault_leaves_both_readers_latched(self):
+        def inject(stage):
+            if stage == 'after_sentinel_flush':
+                raise RuntimeError(stage)
+
+        with self.assertRaisesRegex(RuntimeError, 'after_sentinel_flush'):
+            with self._h5() as f:
+                write_flip_record(
+                    f,
+                    {'state': 'in_progress'},
+                    fault_inject=inject,
+                )
+
+        with self._h5('r') as f:
+            self.assertTrue(f.attrs[LEGACY_FLIP_ATTR])
+            self.assertEqual(read_flip_record(f)['state'], 'failed')
+            self.assertIn('interrupted', read_flip_record(f)['error'])
+
+    def test_fault_after_sentinel_clear_leaves_new_record_durable(self):
+        with self._h5() as f:
+            write_flip_record(f, {'state': 'in_progress', 'version': 1})
+
+            def inject(stage):
+                if stage == 'after_sentinel_clear':
+                    raise RuntimeError(stage)
+
+            with self.assertRaisesRegex(RuntimeError, 'after_sentinel_clear'):
+                write_flip_record(
+                    f,
+                    {'state': 'complete', 'version': 2},
+                    fault_inject=inject,
+                )
+
+        with self._h5('r') as f:
+            self.assertFalse(f.attrs.get(FLIP_RECORD_UPDATE_ATTR, False))
+            self.assertTrue(f.attrs[LEGACY_FLIP_ATTR])
+            self.assertEqual(read_flip_record(f), {
+                'state': 'complete',
+                'version': 2,
+            })
 
     def test_corrupt_record_reads_as_failed_not_untouched(self):
         """A truncated record means a crash mid-write, not a pristine file."""
@@ -464,3 +544,89 @@ class TestFlipRecordGatesReprocessing(TestCase):
         self.assertFalse(record['preview_written'])
         self.assertIn('ffmpeg not found', record['preview_error'])
         self.assertTrue(any('preview movie' in str(w.message) for w in caught))
+
+    def test_preview_is_finalized_before_complete_record(self):
+        import moseq2_app.flip.widget as mod
+
+        path = self._session('a.h5', n_frames=20)
+        widget = self._widget({'a': path})
+        written_states = []
+
+        class Pipe:
+            returncode = 0
+
+            def communicate(self):
+                self.was_finalized = True
+                self.assert_no_complete_yet()
+                return b'', b''
+
+            def assert_no_complete_yet(self):
+                assert 'complete' not in written_states
+
+        pipe = Pipe()
+        pipe.was_finalized = False
+        original_preview = mod.write_frames_preview
+        original_record = mod.write_flip_record
+
+        def preview(*args, **kwargs):
+            return pipe
+
+        def record(f, value, *args, **kwargs):
+            written_states.append(value['state'])
+            return original_record(f, value, *args, **kwargs)
+
+        mod.write_frames_preview = preview
+        mod.write_flip_record = record
+        try:
+            self._run(
+                widget,
+                lambda batch: np.zeros(len(batch), dtype=bool),
+                chunk_size=10,
+                write_movie=True,
+            )
+        finally:
+            mod.write_frames_preview = original_preview
+            mod.write_flip_record = original_record
+
+        self.assertTrue(pipe.was_finalized)
+        self.assertEqual(written_states, ['in_progress', 'complete'])
+        with h5py.File(path, 'r') as f:
+            record = read_flip_record(f)
+        self.assertTrue(record['preview_written'])
+        self.assertIsNone(record['preview_error'])
+
+    def test_preview_nonzero_exit_is_recorded_before_completion(self):
+        import moseq2_app.flip.widget as mod
+
+        path = self._session('a.h5', n_frames=20)
+        widget = self._widget({'a': path})
+
+        class Pipe:
+            returncode = 7
+
+            def communicate(self):
+                return b'', b'encoder exploded'
+
+        pipe = Pipe()
+        original = mod.write_frames_preview
+        mod.write_frames_preview = lambda *args, **kwargs: pipe
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                self._run(
+                    widget,
+                    lambda batch: np.zeros(len(batch), dtype=bool),
+                    chunk_size=10,
+                    write_movie=True,
+                )
+        finally:
+            mod.write_frames_preview = original
+
+        with h5py.File(path, 'r') as f:
+            record = read_flip_record(f)
+        self.assertEqual(record['state'], 'complete')
+        self.assertFalse(record['preview_written'])
+        self.assertIn('status 7', record['preview_error'])
+        self.assertIn('encoder exploded', record['preview_error'])
+        self.assertTrue(any('finalize flipped movie' in str(w.message)
+                            for w in caught))
