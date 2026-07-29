@@ -1,6 +1,9 @@
 import h5py
+import json
 import pickle
+import hashlib
 import warnings
+import datetime
 import panel as pn
 import holoviews as hv
 from tqdm import tqdm
@@ -11,6 +14,32 @@ from collections import defaultdict
 from moseq2_extract.extract.proc import get_flips
 from moseq2_extract.util import gen_batch_sequence
 from moseq2_extract.io.video import write_frames_preview
+
+
+#: h5 dataset holding the flip-classifier processing record.
+FLIP_RECORD_PATH = 'metadata/processing/flip_classifier'
+
+#: Second slot for crash-safe record replacement. Readers select the valid
+#: record with the highest journal sequence, so one HDF5/OS-flushed slot
+#: remains while the other is replaced.
+FLIP_RECORD_JOURNAL_PATH = FLIP_RECORD_PATH + '_journal'
+
+#: h5 attribute used before the structured record existed. Still honoured when
+#: reading so files processed by the older code are not reprocessed.
+LEGACY_FLIP_ATTR = 'flip_classifier_applied'
+
+#: Fail-closed sentinel set before a record update begins and cleared only
+#: after the new slot has been HDF5/OS-flushed.
+FLIP_RECORD_UPDATE_ATTR = 'flip_classifier_record_update_in_progress'
+
+#: Extract's canonical provenance path followed by its historical fallback.
+EXTRACTION_PROVENANCE_PATHS = (
+    'metadata/extraction/pipeline',
+    'metadata/pipeline',
+)
+
+#: Created by extract only when extraction-time flip correction was configured.
+EXTRACTION_FLIPS_PATH = 'metadata/extraction/flips'
 
 
 # Workaround for HoloViews/Bokeh _buffers parameter issue
@@ -42,6 +71,399 @@ def _patch_holoviews_stream_update():
 
 # Apply the patch when this module is imported
 _patch_holoviews_stream_update()
+
+
+class FlipProcessingError(RuntimeError):
+    """
+    Raised when a session's flip-classifier state makes it unsafe to touch.
+
+    The case this exists for is an interrupted run: part of the session has been
+    rotated and part has not, and nothing in the file distinguishes the two, so
+    there is no correct way to continue.
+    """
+
+
+def _sha256(path):
+    """Return the SHA-256 of a file, or None if it cannot be read."""
+    try:
+        digest = hashlib.sha256()
+        with open(str(path), 'rb') as f:
+            for block in iter(lambda: f.read(1024 * 1024), b''):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _app_version_and_sha():
+    """Best-effort version and git commit of the installed moseq2-app."""
+    try:
+        from moseq2_app import __version__ as version
+    except Exception:
+        version = 'unknown'
+    try:
+        import subprocess
+        sha = subprocess.check_output(
+            ['git', '-C', str(Path(__file__).resolve().parent), 'rev-parse', 'HEAD'],
+            stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        sha = 'unknown'
+    return version, sha
+
+
+def read_extraction_provenance(f):
+    """
+    Read the extraction's own provenance record, without modifying it.
+
+    Args:
+    f (h5py.File): open extraction h5.
+
+    Returns:
+    provenance (dict): the extraction provenance, or None if unstamped.
+    """
+    records = []
+    for candidate in EXTRACTION_PROVENANCE_PATHS:
+        if candidate in f:
+            raw = f[candidate][()]
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError) as error:
+                raise FlipProcessingError(
+                    'Corrupt extraction provenance at {}: {}: {}'.format(
+                        candidate, type(error).__name__, error
+                    )
+                )
+            if not isinstance(record, dict):
+                raise FlipProcessingError(
+                    'Corrupt extraction provenance at {}: JSON must be an '
+                    'object/mapping, got {}.'.format(
+                        candidate, type(record).__name__
+                    )
+                )
+            records.append((candidate, record))
+    if not records:
+        return None
+    canonical = {
+        json.dumps(record, sort_keys=True, separators=(',', ':'))
+        for _, record in records
+    }
+    if len(canonical) > 1:
+        raise FlipProcessingError(
+            'Conflicting extraction provenance records exist at {}. Refusing '
+            'to choose one before mutating the session.'.format(
+                ', '.join(path for path, _ in records)
+            )
+        )
+    return records[0][1]
+
+
+def _extraction_policy_snapshot(f):
+    """
+    Snapshot the extraction policies this flip run was applied on top of.
+
+    Returns both the policy map and a hash of it, so a later reader can tell
+    whether two flip-corrected sessions sat on the same extraction semantics
+    without having to compare the maps by hand.
+    """
+    provenance = read_extraction_provenance(f)
+    if not provenance:
+        return None, None
+    policies = provenance.get('policies', {})
+    canonical = json.dumps(policies, sort_keys=True)
+    return policies, hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def read_flip_record(f):
+    """
+    Read the flip-classifier processing record from an open h5 file.
+
+    Args:
+    f (h5py.File): open extraction h5.
+
+    Returns:
+    record (dict): the processing record. Files written before the structured
+        record existed are reported as ``{'state': 'complete', 'legacy': True}``
+        if they carry the old boolean attribute, and ``{'state': 'not_started'}``
+        otherwise, so callers never have to special-case the old format.
+    """
+    valid = []
+    corrupt = []
+    diagnostics = []
+    for path in (FLIP_RECORD_PATH, FLIP_RECORD_JOURNAL_PATH):
+        if path not in f:
+            continue
+        raw = f[path][()]
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        try:
+            record = json.loads(raw)
+            if not isinstance(record, dict):
+                raise ValueError(
+                    'JSON must be an object/mapping, got {}'.format(
+                        type(record).__name__
+                    )
+                )
+            sequence = int(record.pop('_journal_sequence', 0))
+            valid.append((sequence, record))
+            diagnostics.append({
+                'path': path,
+                'sequence': sequence,
+                'state': record.get('state', 'missing'),
+            })
+        except (TypeError, ValueError) as error:
+            corrupt.append(path)
+            diagnostics.append({
+                'path': path,
+                'corrupt': True,
+                'error': '{}: {}'.format(type(error).__name__, error),
+            })
+
+    if f.attrs.get(FLIP_RECORD_UPDATE_ATTR, False):
+        return {
+            'state': 'failed',
+            'error': (
+                'flip processing record update was interrupted; the extent of '
+                'frame correction is unknown and no record slot is trusted '
+                'automatically'
+            ),
+            'diagnostic_slots': diagnostics,
+        }
+
+    if valid:
+        max_sequence = max(sequence for sequence, _ in valid)
+        latest = [record for sequence, record in valid
+                  if sequence == max_sequence]
+        canonical = {
+            json.dumps(record, sort_keys=True, separators=(',', ':'))
+            for record in latest
+        }
+        if len(canonical) > 1:
+            return {
+                'state': 'failed',
+                'error': (
+                    'processing record slots conflict at journal sequence {}; '
+                    'correction extent is unknown'.format(max_sequence)
+                ),
+                'diagnostic_slots': diagnostics,
+            }
+        record = latest[0]
+        record.setdefault('state', 'failed')
+        return record
+
+    if corrupt:
+        # A truncated record means the process died mid-write; treat the file as
+        # being in an unknown state rather than as untouched.
+        return {
+            'state': 'failed',
+            'error': 'processing record is corrupt: {}'.format(', '.join(corrupt)),
+        }
+
+    if f.attrs.get(LEGACY_FLIP_ATTR, False):
+        return {'state': 'complete', 'legacy': True,
+                'note': 'processed before structured records existed; the '
+                        'classifier and settings used are not recorded'}
+
+    return {'state': 'not_started'}
+
+
+def write_flip_record(f, record, fault_inject=None):
+    """
+    Write (or replace) the flip-classifier processing record in an open h5 file.
+
+    Updates use a two-slot journal. The legacy Boolean safety latch and an
+    update sentinel are HDF5/OS-flushed first; then only the inactive record
+    slot is replaced. The sentinel is cleared only after the new slot is
+    flushed. At every tested writer-process termination point, an older app sees
+    the Boolean as true and this reader sees either the prior valid slot or a
+    fail-closed interrupted update.
+
+    This is not a disk transaction and does not claim safety under power loss,
+    kernel/host failure, network/FUSE filesystem semantics, or torn HDF5
+    metadata updates. ``h5py.File.flush`` is not an ``fsync`` barrier.
+
+    Args:
+    f (h5py.File): open extraction h5, opened for writing.
+    record (dict): JSON-serialisable processing record.
+    fault_inject (callable): test-only hook called after each HDF5/OS-flushed
+        update stage with its stage name.
+    """
+
+    def checkpoint(stage):
+        if fault_inject is not None:
+            fault_inject(stage)
+
+    # Older app versions understand only this Boolean. It must be true for
+    # in_progress, failed, and complete because frames may have been touched in
+    # every one of those states.
+    f.attrs[LEGACY_FLIP_ATTR] = True
+    f.attrs[FLIP_RECORD_UPDATE_ATTR] = True
+    f.flush()
+    checkpoint('after_sentinel_flush')
+
+    slots = (FLIP_RECORD_PATH, FLIP_RECORD_JOURNAL_PATH)
+    latest_path = None
+    latest_sequence = -1
+    for path in slots:
+        if path not in f:
+            continue
+        try:
+            raw = f[path][()]
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            existing = json.loads(raw)
+            sequence = int(existing.get('_journal_sequence', 0))
+        except (TypeError, ValueError):
+            continue
+        if sequence > latest_sequence:
+            latest_path = path
+            latest_sequence = sequence
+
+    target_path = (
+        FLIP_RECORD_JOURNAL_PATH
+        if latest_path == FLIP_RECORD_PATH
+        else FLIP_RECORD_PATH
+    )
+    if target_path in f:
+        del f[target_path]
+        f.flush()
+    checkpoint('after_inactive_slot_clear')
+
+    stored = dict(record)
+    stored['_journal_sequence'] = latest_sequence + 1
+    f.create_dataset(target_path, data=json.dumps(stored))
+    checkpoint('after_new_slot_create')
+    f.flush()
+    checkpoint('after_new_slot_flush')
+
+    del f.attrs[FLIP_RECORD_UPDATE_ATTR]
+    f.flush()
+    checkpoint('after_sentinel_clear')
+
+
+def check_extraction_flip_precondition(f, key, path):
+    """
+    Refuse to layer app correction on extraction-time flip correction.
+
+    Extract creates ``metadata/extraction/flips`` only when its own classifier
+    was configured. The app workflow is the alternative for sessions extracted
+    without a classifier; applying both would add pi twice while leaving
+    extraction's authoritative flip array stale for direct HDF5 consumers such
+    as crowd movies.
+    """
+    if EXTRACTION_FLIPS_PATH in f:
+        raise FlipProcessingError(
+            '{} ({}) already carries extraction-time flip correction at {}. '
+            'The app correction is only valid for sessions extracted without '
+            'a flip classifier. Re-extract without extraction-time correction '
+            'before applying the app classifier; the two correction paths must '
+            'not be layered.'.format(key, path, EXTRACTION_FLIPS_PATH)
+        )
+
+
+def _finalize_preview_pipe(video_pipe, key, path, preview_ok, preview_error):
+    """Close a preview subprocess and convert ordinary cleanup failures to record data."""
+    if video_pipe is None:
+        return preview_ok, preview_error
+    try:
+        _, stderr = video_pipe.communicate()
+        returncode = video_pipe.returncode
+        if returncode == 0 and preview_error is None:
+            preview_ok = True
+        elif returncode != 0:
+            preview_ok = False
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors='replace')
+            detail = str(stderr).strip() if stderr else ''
+            preview_error = (
+                'preview subprocess exited with status {}{}'.format(
+                    returncode,
+                    ': ' + detail if detail else '',
+                )
+            )
+            warnings.warn(
+                'Could not finalize flipped movie for {}:{}. Continuing with '
+                'corrected frames; the preview failure is recorded.'.format(
+                    key, path
+                )
+            )
+    except Exception as error:
+        preview_ok = False
+        preview_error = '{}: {}'.format(type(error).__name__, error)
+        warnings.warn(
+            'Could not finalize flipped movie for {}:{}. Continuing with '
+            'corrected frames; the preview failure is recorded.'.format(
+                key, path
+            )
+        )
+    return preview_ok, preview_error
+
+
+def check_flip_state(key, path, record):
+    """
+    Decide what to do with a session given its processing record.
+
+    A completed session is skipped -- that is a normal, safe outcome, and the
+    remaining sessions should still be processed. A session left mid-run is not:
+    its frames are partly rotated and partly not, with no record of where the
+    boundary was, so continuing would produce a file whose orientation is wrong
+    in an unknown subset of frames. That is a hard failure, because the only
+    correct responses are to restore a backup or re-extract from raw data.
+
+    Args:
+    key (str): display name of the session.
+    path (str): path to the session's h5, quoted in the error.
+    record (dict): the record returned by :func:`read_flip_record`.
+
+    Returns:
+    process (bool): True to process the session, False to skip it.
+
+    Raises:
+    FlipProcessingError: if the session was left in an unusable state.
+    """
+    state = record.get('state')
+
+    if state == 'not_started':
+        return True
+
+    if state == 'complete':
+        clf = record.get('classifier_sha256')
+        detail = f' (classifier {clf[:12]})' if clf else ''
+        warnings.warn(
+            f'Flip classifier already applied to {key}{detail}; skipping. '
+            'Rotating frames is its own inverse, so re-running would undo the '
+            'existing correction.')
+        return False
+
+    if state == 'in_progress':
+        corrected = record.get('frames_corrected')
+        total = record.get('n_frames')
+        extent = (f'{corrected} of {total} frames had been committed'
+                  if corrected is not None and total is not None
+                  else 'the number of frames already committed was not recorded')
+        raise FlipProcessingError(
+            f'{key} ({path}) has a flip-classifier run marked in_progress, '
+            f'started {record.get("started", "at an unrecorded time")}. A '
+            'previous run was interrupted partway through rewriting the frames '
+            f'({extent}), so part of the session is rotated and part is not, '
+            'and the file does not record where the boundary was.\n'
+            'This cannot be resumed or re-run safely. Restore this session from '
+            'a backup, or re-extract it from the raw depth data and apply the '
+            'classifier to the fresh output.')
+
+    corrected = record.get('frames_corrected')
+    extent = (
+        '{} frames were reported committed'.format(corrected)
+        if corrected is not None
+        else 'the number of committed frames is not established'
+    )
+    raise FlipProcessingError(
+        f'{key} ({path}) has a failed flip-classifier run recorded: '
+        f'{record.get("error", "no detail recorded")}. {extent}. The record '
+        'does not prove whether correction is absent, partial, or complete, so '
+        'the session remains fail-closed.\nRestore this session from a backup, '
+        'or re-extract it from the raw depth data before retrying.')
 
 
 def _extraction_complete(file_path: Path):
@@ -230,16 +652,71 @@ class FlipClassifierWidget:
                               write_movie=False, verbose=True):
         """
         Apply a trained flip classifier on previously extracted data to flip the mice to the correct orientation.
-    
+
+        This rewrites the frames in place, and rotating a frame by 180 degrees is
+        its own inverse, so applying the classifier twice silently undoes it. To
+        make that impossible, each session carries a processing record at
+        ``metadata/processing/flip_classifier`` recording which classifier (by
+        SHA-256) and settings were used, and one of three states:
+
+        * ``in_progress`` -- written before the first frame is touched. If the
+          process dies here, the record survives and marks the correction
+          extent as unknown.
+        * ``complete`` -- every frame was classified and committed.
+        * ``failed`` -- the run raised, was interrupted, or finished with frames
+          left unclassified.
+
+        The record also carries the package name, version and best-effort git
+        SHA, the classifier's filename and SHA-256, the chunk/overlap/smoothing
+        settings, frame counts, whether the preview movie was written, and a
+        snapshot (plus hash) of the extraction policies the correction was
+        applied on top of. The extraction's own provenance record is read but
+        never modified: it describes how the frames were produced, which is
+        still true afterwards.
+
+        Only a session with no app record or legacy latch is processed. A
+        completed or legacy-processed session is skipped and the rest continue;
+        a session left ``in_progress`` or ``failed`` raises because its exact
+        correction extent is not trustworthy.
+
+        This post-extraction workflow is an alternative to extraction-time flip
+        correction, not a second pass over it. A session carrying
+        ``metadata/extraction/flips`` is refused before any mutation; layering
+        both corrections would add pi twice and leave direct HDF5 consumers
+        using stale extraction flip metadata.
+
         Args:
+        clf_path (str): path to the pickled flip classifier to apply.
         chunk_size (int): size of frame chunks to process in batches.
         chunk_overlap (int): number of frames to overlap between chunks to improve classification precision between chunks.
         smoothing (int): kernel size of the applied median filter on the flip classifier results
+        frame_path (str): h5 path of the frame stack to correct.
+        fps (int): frame rate used when writing the optional preview movie.
+        write_movie (bool): write a preview movie of the corrected frames.
         verbose (bool): displays the tqdm progress bars for each session.
+
+        Raises:
+        FlipProcessingError: if extraction-time correction already exists, or
+            if a prior app run left state whose correction extent is unknown.
+            Such a file must be restored or re-extracted.
+        Exception: anything raised while correcting frames is re-raised after a
+            ``failed`` record has been written to the session's h5.
+
+        Note:
+        This does not provide atomic rollback. Frames are rewritten in place as
+        each batch completes, so an interrupted run leaves the file partially
+        corrected. What the record guarantees is that such a file is detected
+        and refused, not that it can be repaired.
         """
-        video_pipe = None
+        clf_sha256 = _sha256(clf_path)
+        app_version, app_sha = _app_version_and_sha()
+        # NOTE: this used to be `simplefilter('ignore', UserWarning)` for the
+        # whole loop, which also swallowed this function's own diagnostics --
+        # the "already applied, skipping" message included, so a skipped session
+        # was indistinguishable from a processed one. The suppression is now
+        # applied only around the third-party call it was there for
+        # (`get_flips`, which is what emits the sklearn/joblib noise).
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', UserWarning)
             for key, path in tqdm(self.sessions.items(), desc='Flipping extracted sessions...'):
                 # Open h5 file to stream and correct/update stored frames and scalar angles.
                 path = str(path)
@@ -248,14 +725,48 @@ class FlipClassifierWidget:
 
                     # Rotating frames and adding pi to the angle are their own
                     # inverses, so re-running this would silently undo a previous
-                    # correction. Refuse to apply twice.
-                    if f.attrs.get('flip_classifier_applied', False):
-                        warnings.warn(
-                            f'Flip classifier already applied to {key}; skipping '
-                            'to avoid reverting the existing correction.')
+                    # correction. Anything other than a clean not_started state
+                    # means the frames are already modified, or modified to an
+                    # unknown extent, and must not be touched again.
+                    check_extraction_flip_precondition(f, key, path)
+                    if not check_flip_state(key, path, read_flip_record(f)):
                         continue
 
                     frames = f[frame_path]
+
+                    started = datetime.datetime.now().isoformat()
+                    # snapshot, but never modify, the extraction's own provenance:
+                    # it records how the frames were produced, which stays true
+                    # after the flip correction
+                    source_policies, source_policy_sha256 = _extraction_policy_snapshot(f)
+
+                    def make_record(state, **extra):
+                        """Build a processing record with the settings of this run."""
+                        record = {
+                            'package': 'moseq2-app',
+                            'version': app_version,
+                            'git_sha': app_sha,
+                            'state': state,
+                            'classifier_path': str(clf_path),
+                            'classifier_filename': Path(str(clf_path)).name,
+                            'classifier_sha256': clf_sha256,
+                            'chunk_size': int(chunk_size),
+                            'chunk_overlap': int(chunk_overlap),
+                            'smoothing': int(smoothing),
+                            'frame_path': frame_path,
+                            'n_frames': int(len(frames)),
+                            'started': started,
+                            'source_extraction_policies': source_policies,
+                            'source_extraction_policy_sha256': source_policy_sha256,
+                        }
+                        record.update(extra)
+                        return record
+
+                    # Claim the file before modifying a single frame. If this
+                    # process dies mid-session the record stays 'in_progress',
+                    # which is what stops the next run from treating a half
+                    # corrected session as untouched and flipping it again.
+                    write_flip_record(f, make_record('in_progress'))
                     # process every frame; this previously passed len(frames)-1
                     # and so never classified the final frame
                     frame_batches = list(gen_batch_sequence(len(frames), chunk_size, chunk_overlap))
@@ -265,79 +776,141 @@ class FlipClassifierWidget:
                     # share frames, and re-rotating one would undo its correction.
                     committed = np.zeros(len(frames), dtype=bool)
                     make_movie = write_movie
-                    completed = True
+                    n_flipped = 0
+                    # Preview success is UNKNOWN until the subprocess has been
+                    # finalized and its exit status inspected. No terminal
+                    # processing record is written before that happens.
+                    preview_ok = False if write_movie else None
+                    preview_error = None
+                    # Per-session: a failed session must not leak a stale pipe
+                    # handle into the next one.
+                    video_pipe = None
 
-                    for b_i, batch in enumerate(tqdm(frame_batches, desc=f'Adjusting flips: {key}', disable=not verbose)):
-                        batch_idx = np.asarray(list(batch))
-                        frame_batch = frames[batch_idx]
+                    try:
+                        for b_i, batch in enumerate(tqdm(frame_batches, desc=f'Adjusting flips: {key}', disable=not verbose)):
+                            batch_idx = np.asarray(list(batch))
+                            frame_batch = frames[batch_idx]
 
-                        # apply flip classifier on each batch to find which frames to flip.
-                        # the whole batch (including any overlap) is classified so the
-                        # median smoothing has full context at the chunk boundaries
-                        flips = get_flips(frame_batch.copy(), flip_file=clf_path, smoothing=smoothing)
+                            # apply flip classifier on each batch to find which frames to flip.
+                            # the whole batch (including any overlap) is classified so the
+                            # median smoothing has full context at the chunk boundaries
+                            with warnings.catch_warnings():
+                                warnings.simplefilter('ignore', UserWarning)
+                                flips = get_flips(frame_batch.copy(), flip_file=clf_path, smoothing=smoothing)
 
-                        # only commit frames not already handled by an earlier batch
-                        new_local = np.flatnonzero(~committed[batch_idx])
-                        # Defer the trailing overlap of every non-final batch to the
-                        # NEXT batch, where those frames sit near the start and gain
-                        # the future context the overlap exists to provide. Committing
-                        # them here would decide them from the batch that has the least
-                        # of that context.
-                        if chunk_overlap > 0 and b_i < n_batches - 1:
-                            keep = batch_idx[new_local] < batch_idx[-chunk_overlap]
-                            new_local = new_local[keep]
-                        if len(new_local) == 0:
-                            continue
+                            # only commit frames not already handled by an earlier batch
+                            new_local = np.flatnonzero(~committed[batch_idx])
+                            # Defer the trailing overlap of every non-final batch to the
+                            # NEXT batch, where those frames sit near the start and gain
+                            # the future context the overlap exists to provide. Committing
+                            # them here would decide them from the batch that has the least
+                            # of that context.
+                            if chunk_overlap > 0 and b_i < n_batches - 1:
+                                keep = batch_idx[new_local] < batch_idx[-chunk_overlap]
+                                new_local = new_local[keep]
+                            if len(new_local) == 0:
+                                continue
 
-                        flip_local = new_local[flips[new_local]]
-                        if len(flip_local) > 0:
-                            # map batch-relative positions to absolute frame indices.
-                            # the angle update previously used the batch-relative
-                            # indices directly against the whole-session angle array,
-                            # so every batch after the first rotated the angle of the
-                            # wrong frames.
-                            flip_abs = batch_idx[flip_local]
+                            flip_local = new_local[flips[new_local]]
+                            if len(flip_local) > 0:
+                                # map batch-relative positions to absolute frame indices.
+                                # the angle update previously used the batch-relative
+                                # indices directly against the whole-session angle array,
+                                # so every batch after the first rotated the angle of the
+                                # wrong frames.
+                                flip_abs = batch_idx[flip_local]
 
-                            rotated = np.rot90(frames[flip_abs], k=2, axes=(1, 2))
-                            frames[flip_abs] = rotated
-                            frame_batch[flip_local] = rotated
+                                rotated = np.rot90(frames[flip_abs], k=2, axes=(1, 2))
+                                frames[flip_abs] = rotated
+                                frame_batch[flip_local] = rotated
 
-                            angles = f['scalars/angle'][flip_abs]
-                            f['scalars/angle'][flip_abs] = angles + np.pi
+                                angles = f['scalars/angle'][flip_abs]
+                                f['scalars/angle'][flip_abs] = angles + np.pi
+                                n_flipped += len(flip_abs)
 
-                        committed[batch_idx[new_local]] = True
+                            committed[batch_idx[new_local]] = True
 
-                        if make_movie:
-                            try:
-                                # Writing frame batch to mp4 file
-                                video_pipe = write_frames_preview(output_movie,
-                                                                  frame_batch,
-                                                                  pipe=video_pipe,
-                                                                  close_pipe=False,
-                                                                  depth_min=0,
-                                                                  depth_max=100,
-                                                                  fps=fps,
-                                                                  progress_bar=verbose)
-                            except AttributeError as e:
-                                # the preview movie is optional; do not abort frame
-                                # correction (and do not mark the file complete) just
-                                # because the movie could not be written. Stop trying
-                                # to write it and keep correcting frames.
-                                warnings.warn(f'Could not generate flipped movie for {key}:{path}. '
-                                              'Continuing to correct frames without a preview movie.')
-                                print(e)
-                                make_movie = False
+                            if make_movie:
+                                try:
+                                    # Writing frame batch to mp4 file
+                                    video_pipe = write_frames_preview(output_movie,
+                                                                      frame_batch,
+                                                                      pipe=video_pipe,
+                                                                      close_pipe=False,
+                                                                      depth_min=0,
+                                                                      depth_max=100,
+                                                                      fps=fps,
+                                                                      progress_bar=verbose)
+                                except AttributeError as e:
+                                    # the preview movie is optional; do not abort frame
+                                    # correction (and do not mark the file complete) just
+                                    # because the movie could not be written. Stop trying
+                                    # to write it and keep correcting frames.
+                                    warnings.warn(f'Could not generate flipped movie for {key}:{path}. '
+                                                  'Continuing to correct frames without a preview movie.')
+                                    print(e)
+                                    make_movie = False
+                                    preview_ok = False
+                                    preview_error = '{}: {}'.format(type(e).__name__, e)
+
+                        preview_ok, preview_error = _finalize_preview_pipe(
+                            video_pipe, key, path, preview_ok, preview_error
+                        )
+                        video_pipe = None
+                    except BaseException as e:
+                        # Batch failures skip the normal finalization point.
+                        # Close the child before recording failure, but preserve
+                        # and re-raise the original processing exception.
+                        preview_ok, preview_error = _finalize_preview_pipe(
+                            video_pipe, key, path, preview_ok, preview_error
+                        )
+                        video_pipe = None
+                        # Record the failure in the file itself before it propagates.
+                        # The frames written so far are already corrected and the rest
+                        # are not, so the session must never be picked up again as if
+                        # it were untouched. KeyboardInterrupt is caught too -- a
+                        # user pressing ctrl-c leaves exactly the same partial state.
+                        write_flip_record(f, make_record(
+                            'failed',
+                            frames_corrected=int(committed.sum()),
+                            frames_flipped=int(n_flipped),
+                            preview_requested=bool(write_movie),
+                            preview_written=preview_ok,
+                            preview_error=preview_error,
+                            failed_at=datetime.datetime.now().isoformat(),
+                            error='{}: {}'.format(type(e).__name__, e)))
+                        raise
 
                     # only mark the session complete if every frame was corrected;
                     # a partially-processed file must not be flagged done and then
                     # permanently skipped on the next run
-                    if completed and committed.all():
-                        f.attrs['flip_classifier_applied'] = True
-
-                    # Check if video is done writing. If not, wait.
-                    if video_pipe is not None:
-                        video_pipe.communicate()
-                        video_pipe = None
+                    if committed.all():
+                        write_flip_record(f, make_record(
+                            'complete',
+                            frames_corrected=int(committed.sum()),
+                            frames_flipped=int(n_flipped),
+                            preview_requested=bool(write_movie),
+                            preview_written=preview_ok,
+                            preview_error=preview_error,
+                            finished=datetime.datetime.now().isoformat()))
+                    else:
+                        # every frame should have been claimed by some batch; if not,
+                        # the batching is wrong and the session is partially corrected
+                        write_flip_record(f, make_record(
+                            'failed',
+                            frames_corrected=int(committed.sum()),
+                            frames_flipped=int(n_flipped),
+                            preview_requested=bool(write_movie),
+                            preview_written=preview_ok,
+                            preview_error=preview_error,
+                            failed_at=datetime.datetime.now().isoformat(),
+                            error='{} of {} frames were never classified'.format(
+                                int((~committed).sum()), len(frames))))
+                        warnings.warn(
+                            f'{key}: {int((~committed).sum())} of {len(frames)} frames '
+                            'were never classified, so the session is only partially '
+                            'corrected. It has been marked failed and will not be '
+                            'reprocessed; re-extract it before retrying.')
 
     @property
     def training_data_path(self):
