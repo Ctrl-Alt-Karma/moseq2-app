@@ -1,6 +1,9 @@
 import h5py
+import json
 import pickle
+import hashlib
 import warnings
+import datetime
 import panel as pn
 import holoviews as hv
 from tqdm import tqdm
@@ -11,6 +14,14 @@ from collections import defaultdict
 from moseq2_extract.extract.proc import get_flips
 from moseq2_extract.util import gen_batch_sequence
 from moseq2_extract.io.video import write_frames_preview
+
+
+#: h5 dataset holding the flip-classifier processing record.
+FLIP_RECORD_PATH = 'metadata/processing/flip_classifier'
+
+#: h5 attribute used before the structured record existed. Still honoured when
+#: reading so files processed by the older code are not reprocessed.
+LEGACY_FLIP_ATTR = 'flip_classifier_applied'
 
 
 # Workaround for HoloViews/Bokeh _buffers parameter issue
@@ -42,6 +53,93 @@ def _patch_holoviews_stream_update():
 
 # Apply the patch when this module is imported
 _patch_holoviews_stream_update()
+
+
+def _sha256(path):
+    """Return the SHA-256 of a file, or None if it cannot be read."""
+    try:
+        digest = hashlib.sha256()
+        with open(str(path), 'rb') as f:
+            for block in iter(lambda: f.read(1024 * 1024), b''):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def read_flip_record(f):
+    """
+    Read the flip-classifier processing record from an open h5 file.
+
+    Args:
+    f (h5py.File): open extraction h5.
+
+    Returns:
+    record (dict): the processing record. Files written before the structured
+        record existed are reported as ``{'state': 'complete', 'legacy': True}``
+        if they carry the old boolean attribute, and ``{'state': 'not_started'}``
+        otherwise, so callers never have to special-case the old format.
+    """
+    if FLIP_RECORD_PATH in f:
+        raw = f[FLIP_RECORD_PATH][()]
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            # a truncated record means the process died mid-write; treat the
+            # file as being in an unknown state rather than as untouched
+            return {'state': 'failed', 'error': 'processing record is corrupt'}
+        record.setdefault('state', 'failed')
+        return record
+
+    if f.attrs.get(LEGACY_FLIP_ATTR, False):
+        return {'state': 'complete', 'legacy': True,
+                'note': 'processed before structured records existed; the '
+                        'classifier and settings used are not recorded'}
+
+    return {'state': 'not_started'}
+
+
+def write_flip_record(f, record):
+    """
+    Write (or replace) the flip-classifier processing record in an open h5 file.
+
+    The record is flushed immediately. This matters: the whole point of the
+    ``in_progress`` state is that it survives the process being killed halfway
+    through rewriting the frames.
+
+    Args:
+    f (h5py.File): open extraction h5, opened for writing.
+    record (dict): JSON-serialisable processing record.
+    """
+    if FLIP_RECORD_PATH in f:
+        del f[FLIP_RECORD_PATH]
+    f.create_dataset(FLIP_RECORD_PATH, data=json.dumps(record))
+    # keep the legacy attribute in sync so older moseq2-app installs still see
+    # a completed file as completed
+    f.attrs[LEGACY_FLIP_ATTR] = record.get('state') == 'complete'
+    f.flush()
+
+
+def _describe_flip_state(key, record):
+    """Explain why a session is being skipped, in terms the user can act on."""
+    state = record.get('state')
+    if state == 'complete':
+        clf = record.get('classifier_sha256')
+        detail = f' (classifier {clf[:12]})' if clf else ''
+        return (f'Flip classifier already applied to {key}{detail}; skipping. '
+                'Rotating frames is its own inverse, so re-running would undo '
+                'the existing correction.')
+    if state == 'in_progress':
+        return (f'{key} has a flip-classifier run marked in_progress: a previous '
+                'run was interrupted partway through rewriting the frames, so '
+                'part of the session is corrected and part is not. This cannot '
+                'be resumed safely -- re-extract the session and apply the '
+                'classifier to the fresh output.')
+    return (f'{key} has a failed flip-classifier run recorded '
+            f'({record.get("error", "no detail recorded")}). Its frames may be '
+            'partially corrected. Re-extract the session before retrying.')
 
 
 def _extraction_complete(file_path: Path):
@@ -230,16 +328,47 @@ class FlipClassifierWidget:
                               write_movie=False, verbose=True):
         """
         Apply a trained flip classifier on previously extracted data to flip the mice to the correct orientation.
-    
+
+        This rewrites the frames in place, and rotating a frame by 180 degrees is
+        its own inverse, so applying the classifier twice silently undoes it. To
+        make that impossible, each session carries a processing record at
+        ``metadata/processing/flip_classifier`` recording which classifier (by
+        SHA-256) and settings were used, and one of three states:
+
+        * ``in_progress`` -- written before the first frame is touched. If the
+          process dies here, the record survives and marks the session as
+          partially corrected.
+        * ``complete`` -- every frame was classified and committed.
+        * ``failed`` -- the run raised, was interrupted, or finished with frames
+          left unclassified.
+
+        Only a session with no record at all (or one written by an older version
+        that used the ``flip_classifier_applied`` attribute) is processed; the
+        rest are skipped with an explanation.
+
         Args:
+        clf_path (str): path to the pickled flip classifier to apply.
         chunk_size (int): size of frame chunks to process in batches.
         chunk_overlap (int): number of frames to overlap between chunks to improve classification precision between chunks.
         smoothing (int): kernel size of the applied median filter on the flip classifier results
+        frame_path (str): h5 path of the frame stack to correct.
+        fps (int): frame rate used when writing the optional preview movie.
+        write_movie (bool): write a preview movie of the corrected frames.
         verbose (bool): displays the tqdm progress bars for each session.
+
+        Raises:
+        Exception: anything raised while correcting frames is re-raised after a
+            ``failed`` record has been written to the session's h5.
         """
         video_pipe = None
+        clf_sha256 = _sha256(clf_path)
+        # NOTE: this used to be `simplefilter('ignore', UserWarning)` for the
+        # whole loop, which also swallowed this function's own diagnostics --
+        # the "already applied, skipping" message included, so a skipped session
+        # was indistinguishable from a processed one. The suppression is now
+        # applied only around the third-party call it was there for
+        # (`get_flips`, which is what emits the sklearn/joblib noise).
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', UserWarning)
             for key, path in tqdm(self.sessions.items(), desc='Flipping extracted sessions...'):
                 # Open h5 file to stream and correct/update stored frames and scalar angles.
                 path = str(path)
@@ -248,14 +377,39 @@ class FlipClassifierWidget:
 
                     # Rotating frames and adding pi to the angle are their own
                     # inverses, so re-running this would silently undo a previous
-                    # correction. Refuse to apply twice.
-                    if f.attrs.get('flip_classifier_applied', False):
-                        warnings.warn(
-                            f'Flip classifier already applied to {key}; skipping '
-                            'to avoid reverting the existing correction.')
+                    # correction. Anything other than a clean not_started state
+                    # means the frames are already modified, or modified to an
+                    # unknown extent, and must not be touched again.
+                    record = read_flip_record(f)
+                    if record.get('state') != 'not_started':
+                        warnings.warn(_describe_flip_state(key, record))
                         continue
 
                     frames = f[frame_path]
+
+                    started = datetime.datetime.now().isoformat()
+
+                    def make_record(state, **extra):
+                        """Build a processing record with the settings of this run."""
+                        record = {
+                            'state': state,
+                            'classifier_path': str(clf_path),
+                            'classifier_sha256': clf_sha256,
+                            'chunk_size': int(chunk_size),
+                            'chunk_overlap': int(chunk_overlap),
+                            'smoothing': int(smoothing),
+                            'frame_path': frame_path,
+                            'n_frames': int(len(frames)),
+                            'started': started,
+                        }
+                        record.update(extra)
+                        return record
+
+                    # Claim the file before modifying a single frame. If this
+                    # process dies mid-session the record stays 'in_progress',
+                    # which is what stops the next run from treating a half
+                    # corrected session as untouched and flipping it again.
+                    write_flip_record(f, make_record('in_progress'))
                     # process every frame; this previously passed len(frames)-1
                     # and so never classified the final frame
                     frame_batches = list(gen_batch_sequence(len(frames), chunk_size, chunk_overlap))
@@ -265,74 +419,110 @@ class FlipClassifierWidget:
                     # share frames, and re-rotating one would undo its correction.
                     committed = np.zeros(len(frames), dtype=bool)
                     make_movie = write_movie
-                    completed = True
+                    n_flipped = 0
 
-                    for b_i, batch in enumerate(tqdm(frame_batches, desc=f'Adjusting flips: {key}', disable=not verbose)):
-                        batch_idx = np.asarray(list(batch))
-                        frame_batch = frames[batch_idx]
+                    try:
+                        for b_i, batch in enumerate(tqdm(frame_batches, desc=f'Adjusting flips: {key}', disable=not verbose)):
+                            batch_idx = np.asarray(list(batch))
+                            frame_batch = frames[batch_idx]
 
-                        # apply flip classifier on each batch to find which frames to flip.
-                        # the whole batch (including any overlap) is classified so the
-                        # median smoothing has full context at the chunk boundaries
-                        flips = get_flips(frame_batch.copy(), flip_file=clf_path, smoothing=smoothing)
+                            # apply flip classifier on each batch to find which frames to flip.
+                            # the whole batch (including any overlap) is classified so the
+                            # median smoothing has full context at the chunk boundaries
+                            with warnings.catch_warnings():
+                                warnings.simplefilter('ignore', UserWarning)
+                                flips = get_flips(frame_batch.copy(), flip_file=clf_path, smoothing=smoothing)
 
-                        # only commit frames not already handled by an earlier batch
-                        new_local = np.flatnonzero(~committed[batch_idx])
-                        # Defer the trailing overlap of every non-final batch to the
-                        # NEXT batch, where those frames sit near the start and gain
-                        # the future context the overlap exists to provide. Committing
-                        # them here would decide them from the batch that has the least
-                        # of that context.
-                        if chunk_overlap > 0 and b_i < n_batches - 1:
-                            keep = batch_idx[new_local] < batch_idx[-chunk_overlap]
-                            new_local = new_local[keep]
-                        if len(new_local) == 0:
-                            continue
+                            # only commit frames not already handled by an earlier batch
+                            new_local = np.flatnonzero(~committed[batch_idx])
+                            # Defer the trailing overlap of every non-final batch to the
+                            # NEXT batch, where those frames sit near the start and gain
+                            # the future context the overlap exists to provide. Committing
+                            # them here would decide them from the batch that has the least
+                            # of that context.
+                            if chunk_overlap > 0 and b_i < n_batches - 1:
+                                keep = batch_idx[new_local] < batch_idx[-chunk_overlap]
+                                new_local = new_local[keep]
+                            if len(new_local) == 0:
+                                continue
 
-                        flip_local = new_local[flips[new_local]]
-                        if len(flip_local) > 0:
-                            # map batch-relative positions to absolute frame indices.
-                            # the angle update previously used the batch-relative
-                            # indices directly against the whole-session angle array,
-                            # so every batch after the first rotated the angle of the
-                            # wrong frames.
-                            flip_abs = batch_idx[flip_local]
+                            flip_local = new_local[flips[new_local]]
+                            if len(flip_local) > 0:
+                                # map batch-relative positions to absolute frame indices.
+                                # the angle update previously used the batch-relative
+                                # indices directly against the whole-session angle array,
+                                # so every batch after the first rotated the angle of the
+                                # wrong frames.
+                                flip_abs = batch_idx[flip_local]
 
-                            rotated = np.rot90(frames[flip_abs], k=2, axes=(1, 2))
-                            frames[flip_abs] = rotated
-                            frame_batch[flip_local] = rotated
+                                rotated = np.rot90(frames[flip_abs], k=2, axes=(1, 2))
+                                frames[flip_abs] = rotated
+                                frame_batch[flip_local] = rotated
 
-                            angles = f['scalars/angle'][flip_abs]
-                            f['scalars/angle'][flip_abs] = angles + np.pi
+                                angles = f['scalars/angle'][flip_abs]
+                                f['scalars/angle'][flip_abs] = angles + np.pi
+                                n_flipped += len(flip_abs)
 
-                        committed[batch_idx[new_local]] = True
+                            committed[batch_idx[new_local]] = True
 
-                        if make_movie:
-                            try:
-                                # Writing frame batch to mp4 file
-                                video_pipe = write_frames_preview(output_movie,
-                                                                  frame_batch,
-                                                                  pipe=video_pipe,
-                                                                  close_pipe=False,
-                                                                  depth_min=0,
-                                                                  depth_max=100,
-                                                                  fps=fps,
-                                                                  progress_bar=verbose)
-                            except AttributeError as e:
-                                # the preview movie is optional; do not abort frame
-                                # correction (and do not mark the file complete) just
-                                # because the movie could not be written. Stop trying
-                                # to write it and keep correcting frames.
-                                warnings.warn(f'Could not generate flipped movie for {key}:{path}. '
-                                              'Continuing to correct frames without a preview movie.')
-                                print(e)
-                                make_movie = False
+                            if make_movie:
+                                try:
+                                    # Writing frame batch to mp4 file
+                                    video_pipe = write_frames_preview(output_movie,
+                                                                      frame_batch,
+                                                                      pipe=video_pipe,
+                                                                      close_pipe=False,
+                                                                      depth_min=0,
+                                                                      depth_max=100,
+                                                                      fps=fps,
+                                                                      progress_bar=verbose)
+                                except AttributeError as e:
+                                    # the preview movie is optional; do not abort frame
+                                    # correction (and do not mark the file complete) just
+                                    # because the movie could not be written. Stop trying
+                                    # to write it and keep correcting frames.
+                                    warnings.warn(f'Could not generate flipped movie for {key}:{path}. '
+                                                  'Continuing to correct frames without a preview movie.')
+                                    print(e)
+                                    make_movie = False
+                    except BaseException as e:
+                        # Record the failure in the file itself before it propagates.
+                        # The frames written so far are already corrected and the rest
+                        # are not, so the session must never be picked up again as if
+                        # it were untouched. KeyboardInterrupt is caught too -- a
+                        # user pressing ctrl-c leaves exactly the same partial state.
+                        write_flip_record(f, make_record(
+                            'failed',
+                            frames_corrected=int(committed.sum()),
+                            frames_flipped=int(n_flipped),
+                            failed_at=datetime.datetime.now().isoformat(),
+                            error='{}: {}'.format(type(e).__name__, e)))
+                        raise
 
                     # only mark the session complete if every frame was corrected;
                     # a partially-processed file must not be flagged done and then
                     # permanently skipped on the next run
-                    if completed and committed.all():
-                        f.attrs['flip_classifier_applied'] = True
+                    if committed.all():
+                        write_flip_record(f, make_record(
+                            'complete',
+                            frames_corrected=int(committed.sum()),
+                            frames_flipped=int(n_flipped),
+                            finished=datetime.datetime.now().isoformat()))
+                    else:
+                        # every frame should have been claimed by some batch; if not,
+                        # the batching is wrong and the session is partially corrected
+                        write_flip_record(f, make_record(
+                            'failed',
+                            frames_corrected=int(committed.sum()),
+                            frames_flipped=int(n_flipped),
+                            failed_at=datetime.datetime.now().isoformat(),
+                            error='{} of {} frames were never classified'.format(
+                                int((~committed).sum()), len(frames))))
+                        warnings.warn(
+                            f'{key}: {int((~committed).sum())} of {len(frames)} frames '
+                            'were never classified, so the session is only partially '
+                            'corrected. It has been marked failed and will not be '
+                            'reprocessed; re-extract it before retrying.')
 
                     # Check if video is done writing. If not, wait.
                     if video_pipe is not None:
