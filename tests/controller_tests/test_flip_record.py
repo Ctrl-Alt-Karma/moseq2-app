@@ -10,7 +10,10 @@ through and someone re-runs it.
 
 import hashlib
 import json
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import warnings
 from os.path import join
@@ -21,7 +24,10 @@ import numpy as np
 
 from moseq2_app.flip.widget import (FLIP_RECORD_PATH, FLIP_RECORD_JOURNAL_PATH,
                                     FLIP_RECORD_UPDATE_ATTR, LEGACY_FLIP_ATTR,
+                                    EXTRACTION_FLIPS_PATH,
+                                    EXTRACTION_PROVENANCE_PATHS,
                                     FlipProcessingError, _sha256,
+                                    read_extraction_provenance,
                                     read_flip_record, write_flip_record)
 
 
@@ -92,6 +98,7 @@ class TestFlipRecord(TestCase):
             self.assertTrue(f.attrs[LEGACY_FLIP_ATTR])
 
     def test_fault_injection_never_fails_open(self):
+        """Lightweight exception-hook coverage; this is not process death."""
         stages = (
             'after_sentinel_flush',
             'after_inactive_slot_clear',
@@ -128,6 +135,63 @@ class TestFlipRecord(TestCase):
                     FLIP_RECORD_PATH in f or FLIP_RECORD_JOURNAL_PATH in f,
                     stage,
                 )
+
+    def test_abrupt_process_death_at_every_checkpoint_is_fail_closed(self):
+        stages = (
+            'after_sentinel_flush',
+            'after_inactive_slot_clear',
+            'after_new_slot_create',
+            'after_new_slot_flush',
+            'after_sentinel_clear',
+        )
+        child = r'''
+import os
+import signal
+import sys
+import h5py
+from moseq2_app.flip.widget import write_flip_record
+path, stage = sys.argv[1:3]
+def inject(current):
+    if current == stage:
+        if os.name == "posix":
+            os.kill(os.getpid(), signal.SIGKILL)
+        os._exit(99)
+with h5py.File(path, "a") as handle:
+    write_flip_record(
+        handle,
+        {"state": "complete", "frames_corrected": 10},
+        fault_inject=inject,
+    )
+'''
+        for stage in stages:
+            path = join(self.tmp, 'abrupt-' + stage + '.h5')
+            with h5py.File(path, 'w') as f:
+                write_flip_record(f, {
+                    'state': 'in_progress',
+                    'frames_corrected': 0,
+                })
+
+            result = subprocess.run(
+                [sys.executable, '-c', child, path, stage],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(result.returncode, 0, stage)
+
+            # Parent reopen proves HDF5 readability after real unclean child
+            # termination. Slot persistence can vary by HDF5/platform; the
+            # reader semantics may not.
+            with h5py.File(path, 'r') as f:
+                self.assertTrue(f.attrs[LEGACY_FLIP_ATTR], stage)
+                record = read_flip_record(f)
+                if stage == 'after_sentinel_clear':
+                    self.assertFalse(
+                        f.attrs.get(FLIP_RECORD_UPDATE_ATTR, False), stage)
+                    self.assertEqual(record['state'], 'complete', stage)
+                else:
+                    self.assertTrue(
+                        f.attrs.get(FLIP_RECORD_UPDATE_ATTR, False), stage)
+                    self.assertEqual(record['state'], 'failed', stage)
 
     def test_initial_record_fault_leaves_both_readers_latched(self):
         def inject(stage):
@@ -179,6 +243,70 @@ class TestFlipRecord(TestCase):
         self.assertEqual(record['state'], 'failed')
         self.assertIn('corrupt', record['error'])
 
+    def test_non_mapping_json_reads_as_corrupt_not_attribute_error(self):
+        for payload in ('null', '7', '"text"', '["item"]'):
+            with self.subTest(payload=payload):
+                path = join(self.tmp, hashlib.sha256(
+                    payload.encode()).hexdigest() + '.h5')
+                with h5py.File(path, 'w') as f:
+                    f.create_dataset(FLIP_RECORD_PATH, data=payload)
+                with h5py.File(path, 'r') as f:
+                    record = read_flip_record(f)
+                self.assertEqual(record['state'], 'failed')
+                self.assertIn('corrupt', record['error'])
+
+    def test_mapping_json_remains_valid(self):
+        with self._h5() as f:
+            f.create_dataset(
+                FLIP_RECORD_PATH,
+                data=json.dumps({'state': 'complete', 'frames_corrected': 4}))
+        with self._h5('r') as f:
+            record = read_flip_record(f)
+        self.assertEqual(record['state'], 'complete')
+        self.assertEqual(record['frames_corrected'], 4)
+
+    def test_sentinel_diagnostics_never_auto_trust_slots(self):
+        cases = (
+            ('none', []),
+            ('failed', [('failed', 1)]),
+            ('complete', [('complete', 2)]),
+            ('conflicting', [('failed', 3), ('complete', 3)]),
+        )
+        for name, slots in cases:
+            path = join(self.tmp, 'sentinel-' + name + '.h5')
+            with h5py.File(path, 'w') as f:
+                f.attrs[FLIP_RECORD_UPDATE_ATTR] = True
+                for (state, sequence), slot_path in zip(
+                        slots, (FLIP_RECORD_PATH, FLIP_RECORD_JOURNAL_PATH)):
+                    f.create_dataset(slot_path, data=json.dumps({
+                        'state': state,
+                        '_journal_sequence': sequence,
+                    }))
+            with h5py.File(path, 'r') as f:
+                record = read_flip_record(f)
+            self.assertEqual(record['state'], 'failed', name)
+            self.assertIn('unknown', record['error'], name)
+            self.assertEqual(len(record['diagnostic_slots']), len(slots), name)
+            diagnostic_states = {
+                item.get('state') for item in record['diagnostic_slots']
+            }
+            self.assertEqual(
+                diagnostic_states, {state for state, _ in slots}, name)
+
+    def test_conflicting_same_sequence_slots_fail_closed(self):
+        with self._h5() as f:
+            f.create_dataset(FLIP_RECORD_PATH, data=json.dumps({
+                'state': 'failed', '_journal_sequence': 7,
+            }))
+            f.create_dataset(FLIP_RECORD_JOURNAL_PATH, data=json.dumps({
+                'state': 'complete', '_journal_sequence': 7,
+            }))
+        with self._h5('r') as f:
+            record = read_flip_record(f)
+        self.assertEqual(record['state'], 'failed')
+        self.assertIn('conflict', record['error'])
+        self.assertEqual(len(record['diagnostic_slots']), 2)
+
     def test_record_without_state_reads_as_failed(self):
         with self._h5() as f:
             f.create_dataset(FLIP_RECORD_PATH, data=json.dumps({'n_frames': 10}))
@@ -195,6 +323,47 @@ class TestFlipRecord(TestCase):
 
     def test_sha256_of_missing_file_is_none(self):
         self.assertIsNone(_sha256(join(self.tmp, 'nope.pkl')))
+
+    def test_extraction_provenance_uses_canonical_path_order(self):
+        self.assertEqual(
+            EXTRACTION_PROVENANCE_PATHS,
+            ('metadata/extraction/pipeline', 'metadata/pipeline'),
+        )
+
+    def test_identical_dual_extraction_provenance_is_accepted(self):
+        record = {'package': 'moseq2-extract', 'policies': {'x': 'same'}}
+        with self._h5() as f:
+            for path in EXTRACTION_PROVENANCE_PATHS:
+                f.create_dataset(path, data=json.dumps(record))
+            self.assertEqual(read_extraction_provenance(f), record)
+
+    def test_conflicting_dual_extraction_provenance_is_refused(self):
+        with self._h5() as f:
+            f.create_dataset(
+                EXTRACTION_PROVENANCE_PATHS[0],
+                data=json.dumps({
+                    'package': 'moseq2-extract',
+                    'policies': {'x': 'first'},
+                }),
+            )
+            f.create_dataset(
+                EXTRACTION_PROVENANCE_PATHS[1],
+                data=json.dumps({
+                    'package': 'moseq2-extract',
+                    'policies': {'x': 'second'},
+                }),
+            )
+            with self.assertRaisesRegex(
+                    FlipProcessingError, 'Conflicting extraction provenance'):
+                read_extraction_provenance(f)
+
+    def test_corrupt_extraction_provenance_is_refused(self):
+        with self._h5() as f:
+            f.create_dataset(
+                EXTRACTION_PROVENANCE_PATHS[0], data='{"policies": ')
+            with self.assertRaisesRegex(
+                    FlipProcessingError, 'Corrupt extraction provenance'):
+                read_extraction_provenance(f)
 
 
 class TestFlipRecordGatesReprocessing(TestCase):
@@ -264,6 +433,32 @@ class TestFlipRecordGatesReprocessing(TestCase):
         self.assertEqual(record['chunk_size'], 20)
         self.assertIn('started', record)
         self.assertIn('finished', record)
+
+    def test_refuses_session_with_extraction_time_flip_correction(self):
+        path = self._session('already-corrected.h5', n_frames=20)
+        with h5py.File(path, 'a') as f:
+            f.create_dataset(
+                EXTRACTION_FLIPS_PATH,
+                data=np.asarray([False, True] + [False] * 18, dtype=bool),
+            )
+            frames_before = f['frames'][:].copy()
+            angles_before = f['scalars/angle'][:].copy()
+
+        widget = self._widget({'a': path})
+        with self.assertRaisesRegex(
+                FlipProcessingError, 'extraction-time flip correction'):
+            self._run(
+                widget,
+                lambda batch: np.ones(len(batch), dtype=bool),
+                chunk_size=20,
+            )
+
+        with h5py.File(path, 'r') as f:
+            np.testing.assert_array_equal(frames_before, f['frames'][:])
+            np.testing.assert_array_equal(angles_before, f['scalars/angle'][:])
+            self.assertNotIn(FLIP_RECORD_PATH, f)
+            self.assertNotIn(FLIP_RECORD_JOURNAL_PATH, f)
+            self.assertFalse(f.attrs.get(LEGACY_FLIP_ATTR, False))
 
     def test_completed_session_is_skipped_not_reflipped(self):
         path = self._session('a.h5', n_frames=20)
@@ -630,3 +825,46 @@ class TestFlipRecordGatesReprocessing(TestCase):
         self.assertIn('encoder exploded', record['preview_error'])
         self.assertTrue(any('finalize flipped movie' in str(w.message)
                             for w in caught))
+
+    def test_preview_is_finalized_on_mid_batch_exception(self):
+        path = self._session('preview-exception.h5', n_frames=20)
+        widget = self._widget({'a': path})
+
+        class Pipe:
+            returncode = 0
+
+            def __init__(self):
+                self.communicated = False
+
+            def communicate(self):
+                self.communicated = True
+                return b'', b''
+
+        pipe = Pipe()
+        calls = {'n': 0}
+
+        def flips(batch):
+            calls['n'] += 1
+            if calls['n'] == 2:
+                raise RuntimeError('classifier exploded')
+            return np.zeros(len(batch), dtype=bool)
+
+        import moseq2_app.flip.widget as mod
+        original_preview = mod.write_frames_preview
+        mod.write_frames_preview = lambda *args, **kwargs: pipe
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'classifier exploded'):
+                self._run(
+                    widget,
+                    flips,
+                    chunk_size=10,
+                    write_movie=True,
+                )
+        finally:
+            mod.write_frames_preview = original_preview
+
+        self.assertTrue(pipe.communicated)
+        with h5py.File(path, 'r') as f:
+            record = read_flip_record(f)
+        self.assertEqual(record['state'], 'failed')
+        self.assertIn('classifier exploded', record['error'])
