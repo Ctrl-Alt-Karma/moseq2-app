@@ -258,13 +258,16 @@ class FlipClassifierWidget:
                     frames = f[frame_path]
                     # process every frame; this previously passed len(frames)-1
                     # and so never classified the final frame
-                    frame_batches = gen_batch_sequence(len(frames), chunk_size, chunk_overlap)
+                    frame_batches = list(gen_batch_sequence(len(frames), chunk_size, chunk_overlap))
+                    n_batches = len(frame_batches)
 
                     # frames already corrected in this run. Overlapping batches
                     # share frames, and re-rotating one would undo its correction.
                     committed = np.zeros(len(frames), dtype=bool)
+                    make_movie = write_movie
+                    completed = True
 
-                    for batch in tqdm(frame_batches, desc=f'Adjusting flips: {key}', disable=not verbose):
+                    for b_i, batch in enumerate(tqdm(frame_batches, desc=f'Adjusting flips: {key}', disable=not verbose)):
                         batch_idx = np.asarray(list(batch))
                         frame_batch = frames[batch_idx]
 
@@ -275,6 +278,14 @@ class FlipClassifierWidget:
 
                         # only commit frames not already handled by an earlier batch
                         new_local = np.flatnonzero(~committed[batch_idx])
+                        # Defer the trailing overlap of every non-final batch to the
+                        # NEXT batch, where those frames sit near the start and gain
+                        # the future context the overlap exists to provide. Committing
+                        # them here would decide them from the batch that has the least
+                        # of that context.
+                        if chunk_overlap > 0 and b_i < n_batches - 1:
+                            keep = batch_idx[new_local] < batch_idx[-chunk_overlap]
+                            new_local = new_local[keep]
                         if len(new_local) == 0:
                             continue
 
@@ -296,8 +307,7 @@ class FlipClassifierWidget:
 
                         committed[batch_idx[new_local]] = True
 
-
-                        if write_movie:
+                        if make_movie:
                             try:
                                 # Writing frame batch to mp4 file
                                 video_pipe = write_frames_preview(output_movie,
@@ -309,12 +319,20 @@ class FlipClassifierWidget:
                                                                   fps=fps,
                                                                   progress_bar=verbose)
                             except AttributeError as e:
-                                warnings.warn(f'Could not generate flipped movie for {key}:{path}. Skipping...')
+                                # the preview movie is optional; do not abort frame
+                                # correction (and do not mark the file complete) just
+                                # because the movie could not be written. Stop trying
+                                # to write it and keep correcting frames.
+                                warnings.warn(f'Could not generate flipped movie for {key}:{path}. '
+                                              'Continuing to correct frames without a preview movie.')
                                 print(e)
-                                print(e.__traceback__)
-                                break
-                    # mark the session so a re-run does not revert the correction
-                    f.attrs['flip_classifier_applied'] = True
+                                make_movie = False
+
+                    # only mark the session complete if every frame was corrected;
+                    # a partially-processed file must not be flagged done and then
+                    # permanently skipped on the next run
+                    if completed and committed.all():
+                        f.attrs['flip_classifier_applied'] = True
 
                     # Check if video is done writing. If not, wait.
                     if video_pipe is not None:

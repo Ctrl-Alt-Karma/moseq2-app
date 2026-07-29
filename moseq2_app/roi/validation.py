@@ -22,9 +22,8 @@ def check_timestamp_error_percentage(timestamps, fps=30, scaling_factor=1000):
     scaling_factor (float): factor to divide timestamps by to convert timestamp milliseconds into seconds.
 
     Returns:
-    percentError (float): Percentage of frames that were dropped/missed during acquisition.
+    percentError (float): Fraction of frames that were dropped/missed during acquisition.
     """
-    # https://www.mathworks.com/help/imaq/examples/determining-the-rate-of-acquisition.html
     # Find the time difference between frames.
     diff = np.diff(timestamps)
 
@@ -34,17 +33,20 @@ def check_timestamp_error_percentage(timestamps, fps=30, scaling_factor=1000):
         # arrays are promoted to float instead of raising a dtype casting error)
         diff = diff / scaling_factor
 
-    # Find the average time difference between frames.
-    avgTime = np.mean(diff)
+    # Count ACTUAL dropped frames rather than average frame-rate error. The old
+    # formula compared the mean interval to 1/fps, so a recording made at a
+    # steady but slightly different rate (e.g. 28 fps) reported a large "dropped
+    # frames" percentage despite dropping nothing. Instead, express each gap as a
+    # number of expected frame intervals and count the missing ones.
+    expected_dt = 1.0 / fps
+    steps = np.rint(diff / expected_dt).astype(int)
+    dropped = np.maximum(steps - 1, 0).sum()
+    expected_frames = len(timestamps) + dropped
 
-    # Determine the experimental frame rate.
-    expRate = 1 / avgTime
+    if expected_frames <= 0:
+        return 0.0
 
-    # Determine the percent error between the determined and actual frame rate.
-    diffRates = abs(fps - expRate)
-    percentError = (diffRates / fps)
-
-    return percentError
+    return dropped / expected_frames
 
 def count_nan_rows(scalar_df):
     """
