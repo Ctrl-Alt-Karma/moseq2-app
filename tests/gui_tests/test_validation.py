@@ -1,3 +1,4 @@
+import pytest
 import h5py
 import numpy as np
 import pandas as pd
@@ -24,14 +25,20 @@ class TestExtractionValidation(TestCase):
         with h5py.File(h5path, 'r') as f:
             timestamps = f['timestamps'][()]
 
+        # check_timestamp_error_percentage now counts actual dropped frames
+        # rather than average frame-rate error
         percent_error = check_timestamp_error_percentage(timestamps)
 
-        assert percent_error == 0.011003544858038812
+        assert percent_error == pytest.approx(0.01098901098901099)
 
-        azure_ts = load_timestamps_from_movie(paths['azure_test'])
-        percent_error = check_timestamp_error_percentage(azure_ts)
+        # a recording at a steady but non-nominal rate drops no frames and must
+        # report 0, where the old frame-rate-error formula reported ~6.7%
+        steady_28fps = np.arange(300) / 28.0
+        assert check_timestamp_error_percentage(steady_28fps, fps=30) == 0.0
 
-        assert percent_error == 0.2615314701204273
+        # a single injected gap (one missing frame among 100) is ~1/101
+        one_gap = np.delete(np.arange(101) / 30.0, 50)
+        assert check_timestamp_error_percentage(one_gap, fps=30) == pytest.approx(1 / 101)
 
     def test_count_nan_rows(self):
 
