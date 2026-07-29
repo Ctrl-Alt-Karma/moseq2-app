@@ -8,6 +8,7 @@ case that actually happens in a lab, where a long run is interrupted partway
 through and someone re-runs it.
 """
 
+import hashlib
 import json
 import shutil
 import tempfile
@@ -19,8 +20,8 @@ import h5py
 import numpy as np
 
 from moseq2_app.flip.widget import (FLIP_RECORD_PATH, LEGACY_FLIP_ATTR,
-                                    _sha256, read_flip_record,
-                                    write_flip_record)
+                                    FlipProcessingError, _sha256,
+                                    read_flip_record, write_flip_record)
 
 
 class TestFlipRecord(TestCase):
@@ -210,41 +211,47 @@ class TestFlipRecordGatesReprocessing(TestCase):
         np.testing.assert_array_equal(angles_first, angles_second)
         self.assertTrue(any('already applied' in str(w.message) for w in caught))
 
-    def test_in_progress_record_blocks_reprocessing(self):
+    def test_in_progress_record_is_a_hard_refusal(self):
         path = self._session('a.h5', existing_record={
-            'state': 'in_progress', 'n_frames': 20, 'started': '2026-07-29T00:00:00'})
+            'state': 'in_progress', 'n_frames': 20, 'frames_corrected': 7,
+            'started': '2026-07-29T00:00:00'})
         widget = self._widget({'a': path})
 
         with h5py.File(path, 'r') as f:
             before = f['frames'][:].copy()
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
+        with self.assertRaises(FlipProcessingError) as ctx:
             self._run(widget, lambda b: np.ones(len(b), dtype=bool), chunk_size=20)
 
+        message = str(ctx.exception)
+        self.assertIn('in_progress', message)
+        self.assertIn(path, message)
+        # the user needs to know how far it got and what to do
+        self.assertIn('7 of 20', message)
+        self.assertIn('re-extract', message.lower())
+
+        # and nothing may have been touched
         with h5py.File(path, 'r') as f:
             np.testing.assert_array_equal(before, f['frames'][:])
             self.assertEqual(read_flip_record(f)['state'], 'in_progress')
 
-        message = ' '.join(str(w.message) for w in caught)
-        self.assertIn('in_progress', message)
-        self.assertIn('re-extract', message.lower())
-
-    def test_failed_record_blocks_reprocessing(self):
+    def test_failed_record_is_a_hard_refusal(self):
         path = self._session('a.h5', existing_record={
-            'state': 'failed', 'error': 'disk full', 'n_frames': 20})
+            'state': 'failed', 'error': 'disk full', 'n_frames': 20,
+            'frames_corrected': 12})
         widget = self._widget({'a': path})
 
         with h5py.File(path, 'r') as f:
             before = f['frames'][:].copy()
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
+        with self.assertRaises(FlipProcessingError) as ctx:
             self._run(widget, lambda b: np.ones(len(b), dtype=bool), chunk_size=20)
+
+        self.assertIn('disk full', str(ctx.exception))
+        self.assertIn('re-extract', str(ctx.exception).lower())
 
         with h5py.File(path, 'r') as f:
             np.testing.assert_array_equal(before, f['frames'][:])
-        self.assertIn('disk full', ' '.join(str(w.message) for w in caught))
 
     def test_legacy_processed_session_is_skipped(self):
         path = self._session('a.h5', legacy=True)
@@ -299,7 +306,7 @@ class TestFlipRecordGatesReprocessing(TestCase):
         with h5py.File(path, 'r') as f:
             self.assertEqual(read_flip_record(f)['state'], 'failed')
 
-    def test_session_crashed_then_rerun_is_not_double_flipped(self):
+    def test_session_crashed_then_rerun_is_refused_not_double_flipped(self):
         """The whole point: a crash followed by a re-run must not undo work."""
         path = self._session('a.h5', n_frames=20)
         widget = self._widget({'a': path})
@@ -319,10 +326,141 @@ class TestFlipRecordGatesReprocessing(TestCase):
             after_crash = f['frames'][:].copy()
             angles_after_crash = f['scalars/angle'][:].copy()
 
-        with warnings.catch_warnings(record=True):
-            warnings.simplefilter('always')
+        # the re-run must refuse rather than flip the first 10 frames back
+        with self.assertRaises(FlipProcessingError):
             self._run(widget, lambda b: np.ones(len(b), dtype=bool), chunk_size=10)
 
         with h5py.File(path, 'r') as f:
             np.testing.assert_array_equal(after_crash, f['frames'][:])
             np.testing.assert_array_equal(angles_after_crash, f['scalars/angle'][:])
+
+    def test_completed_session_skips_and_later_sessions_still_run(self):
+        """A finished session is a normal skip, not a reason to abort the batch."""
+        done = self._session('done.h5', n_frames=20)
+        with h5py.File(done, 'a') as f:
+            write_flip_record(f, {'state': 'complete', 'n_frames': 20})
+        todo = self._session('todo.h5', n_frames=20)
+        widget = self._widget({'done': done, 'todo': todo})
+
+        with h5py.File(done, 'r') as f:
+            done_before = f['frames'][:].copy()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            self._run(widget, lambda b: np.ones(len(b), dtype=bool), chunk_size=20)
+
+        with h5py.File(done, 'r') as f:
+            np.testing.assert_array_equal(done_before, f['frames'][:])
+        with h5py.File(todo, 'r') as f:
+            self.assertEqual(read_flip_record(f)['state'], 'complete')
+        self.assertTrue(any('already applied' in str(w.message) for w in caught))
+
+    def test_complete_record_carries_the_full_field_set(self):
+        path = self._session('a.h5', n_frames=20)
+        widget = self._widget({'a': path})
+        self._run(widget, lambda b: np.zeros(len(b), dtype=bool), chunk_size=10,
+                  chunk_overlap=2, smoothing=31)
+
+        with h5py.File(path, 'r') as f:
+            record = read_flip_record(f)
+
+        for field in ('package', 'version', 'git_sha', 'state',
+                      'classifier_path', 'classifier_filename', 'classifier_sha256',
+                      'chunk_size', 'chunk_overlap', 'smoothing', 'frame_path',
+                      'n_frames', 'frames_corrected', 'frames_flipped',
+                      'started', 'finished', 'preview_requested', 'preview_written',
+                      'source_extraction_policies', 'source_extraction_policy_sha256'):
+            self.assertIn(field, record)
+
+        self.assertEqual(record['package'], 'moseq2-app')
+        self.assertEqual(record['classifier_filename'], 'clf.pkl')
+        self.assertEqual(record['chunk_overlap'], 2)
+        self.assertEqual(record['smoothing'], 31)
+        self.assertFalse(record['preview_requested'])
+        self.assertIsNone(record['preview_written'])
+
+    def test_classifier_hash_changes_when_classifier_bytes_change(self):
+        path_a = self._session('a.h5', n_frames=20)
+        widget = self._widget({'a': path_a})
+        self._run(widget, lambda b: np.zeros(len(b), dtype=bool), chunk_size=20)
+        with h5py.File(path_a, 'r') as f:
+            sha_a = read_flip_record(f)['classifier_sha256']
+
+        # retrain: same path, different bytes
+        with open(self.clf, 'wb') as f:
+            f.write(b'stub classifier v2')
+
+        path_b = self._session('b.h5', n_frames=20)
+        widget = self._widget({'b': path_b})
+        self._run(widget, lambda b: np.zeros(len(b), dtype=bool), chunk_size=20)
+        with h5py.File(path_b, 'r') as f:
+            sha_b = read_flip_record(f)['classifier_sha256']
+
+        self.assertNotEqual(sha_a, sha_b)
+        self.assertEqual(sha_b, _sha256(self.clf))
+
+    def test_extraction_provenance_is_snapshotted_but_not_modified(self):
+        policies = {'scalar_px_to_mm': 'pinhole', 'area_units': 'mm2-xy-product'}
+        extraction = {'package': 'moseq2-extract', 'version': '1.2.0',
+                      'git_sha': 'abc123', 'policies': policies}
+        path = self._session('a.h5', n_frames=20)
+        with h5py.File(path, 'a') as f:
+            f.create_dataset('metadata/extraction/pipeline', data=json.dumps(extraction))
+
+        widget = self._widget({'a': path})
+        self._run(widget, lambda b: np.zeros(len(b), dtype=bool), chunk_size=20)
+
+        with h5py.File(path, 'r') as f:
+            # the extraction record must come back byte-identical
+            raw = f['metadata/extraction/pipeline'][()]
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            self.assertEqual(json.loads(raw), extraction)
+
+            record = read_flip_record(f)
+
+        self.assertEqual(record['source_extraction_policies'], policies)
+        expected = hashlib.sha256(
+            json.dumps(policies, sort_keys=True).encode()).hexdigest()
+        self.assertEqual(record['source_extraction_policy_sha256'], expected)
+
+    def test_unstamped_extraction_snapshots_as_none(self):
+        path = self._session('a.h5', n_frames=20)
+        widget = self._widget({'a': path})
+        self._run(widget, lambda b: np.zeros(len(b), dtype=bool), chunk_size=20)
+        with h5py.File(path, 'r') as f:
+            record = read_flip_record(f)
+        self.assertIsNone(record['source_extraction_policies'])
+        self.assertIsNone(record['source_extraction_policy_sha256'])
+
+    def test_preview_failure_still_completes_frames_but_is_recorded(self):
+        """Frame correction is the deliverable; the preview movie is not."""
+        import moseq2_app.flip.widget as mod
+
+        path = self._session('a.h5', n_frames=20)
+        widget = self._widget({'a': path})
+
+        def boom(*args, **kwargs):
+            raise AttributeError('ffmpeg not found')
+
+        original = mod.write_frames_preview
+        mod.write_frames_preview = boom
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                self._run(widget, lambda b: np.zeros(len(b), dtype=bool),
+                          chunk_size=10, write_movie=True)
+        finally:
+            mod.write_frames_preview = original
+
+        with h5py.File(path, 'r') as f:
+            record = read_flip_record(f)
+
+        # frames were fully corrected despite the preview failing
+        self.assertEqual(record['state'], 'complete')
+        self.assertEqual(record['frames_corrected'], 20)
+        # ...and the preview failure is on the record, not just in a warning
+        self.assertTrue(record['preview_requested'])
+        self.assertFalse(record['preview_written'])
+        self.assertIn('ffmpeg not found', record['preview_error'])
+        self.assertTrue(any('preview movie' in str(w.message) for w in caught))
